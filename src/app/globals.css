@@ -1,0 +1,120 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Local font: Architype Stedelijk (logo only) ─────────────────────── */
+@font-face {
+  font-family: "Architype Stedelijk";
+  src: url("/fonts/Architype-Stedelijk.woff2") format("woff2");
+  font-weight: normal;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ── Design tokens — "Architectural Precision" palette ───────────────────
+   Surfaces use tonal layering (no 1px sectioning borders). Primary tokens
+   are exposed as HSL triples so shadcn/Tailwind utilities keep working. */
+@layer base {
+  :root {
+    /* Surfaces — raw hex for direct use */
+    --surface:                 #f7fafd;
+    --surface-container-low:   #f1f4f7;
+    --surface-container:       #ebeef2;
+    --surface-container-high:  #e5e9ee;
+    --surface-container-lowest:#ffffff;
+
+    --on-surface:         #181c1e;
+    --on-surface-variant: #464555;
+    --outline-variant:    #c4c7ca;
+
+    --brand-primary:         #493ee5;
+    --brand-primary-container:#635bff;
+    --brand-on-primary:      #ffffff;
+
+    /* HSL mirrors for shadcn utilities */
+    --background:             210 29% 98%;  /* surface */
+    --foreground:             200 9% 11%;   /* on-surface */
+    --card:                   0 0% 100%;    /* surface-container-lowest */
+    --card-foreground:        200 9% 11%;
+    --popover:                0 0% 100%;
+    --popover-foreground:     200 9% 11%;
+    --primary:                244 78% 57%;  /* brand-primary */
+    --primary-foreground:     0 0% 100%;
+    --secondary:              210 18% 96%;  /* surface-container-low */
+    --secondary-foreground:   200 9% 11%;
+    --muted:                  210 18% 96%;
+    --muted-foreground:       243 11% 31%;  /* on-surface-variant */
+    --accent:                 210 18% 94%;
+    --accent-foreground:      200 9% 11%;
+    --destructive:            0 72% 50%;
+    --destructive-foreground: 0 0% 100%;
+    --border:                 215 8% 78%;   /* outline-variant (ghost) */
+    --input:                  215 8% 78%;
+    --ring:                   244 78% 57%;
+    --radius:                 0.5rem;       /* 8px — outer containers */
+  }
+}
+
+@layer base {
+  * { @apply border-border; }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: var(--font-inter), ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+                 Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-size: 14px;          /* body-md — shifted one step smaller */
+    line-height: 1.45;
+    font-feature-settings: "ss01" 1, "cv11" 1;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Headlines get the modernist tracking */
+  h1, h2, h3 { letter-spacing: 0.02em; }
+
+  /* Numbers everywhere align */
+  .tabular, table, input[type="number"] { font-variant-numeric: tabular-nums; }
+}
+
+/* ── Utility classes ──────────────────────────────────────────────────── */
+@layer components {
+  /* Logo wordmark — Architype Stedelijk */
+  .font-stedelijk {
+    font-family: "Architype Stedelijk", var(--font-inter), sans-serif;
+    letter-spacing: 0.02em;
+  }
+
+  /* Primary CTA: subtle gradient instead of flat fill */
+  .btn-gradient {
+    background-image: linear-gradient(135deg, var(--brand-primary) 0%, var(--brand-primary-container) 100%);
+    color: var(--brand-on-primary);
+  }
+
+  /* Ghost border — 1px at low opacity, only when a boundary is truly needed */
+  .border-ghost {
+    border: 1px solid rgba(196, 199, 202, 0.35);
+  }
+  .border-t-ghost { border-top: 1px solid rgba(196, 199, 202, 0.35); }
+  .border-b-ghost { border-bottom: 1px solid rgba(196, 199, 202, 0.35); }
+
+  /* Surface helpers */
+  .bg-surface         { background-color: var(--surface); }
+  .bg-surface-low     { background-color: var(--surface-container-low); }
+  .bg-surface-mid     { background-color: var(--surface-container); }
+  .bg-surface-high    { background-color: var(--surface-container-high); }
+  .bg-surface-lowest  { background-color: var(--surface-container-lowest); }
+  .text-on-surface    { color: var(--on-surface); }
+  .text-on-surface-var{ color: var(--on-surface-variant); }
+
+  /* Source indicator pills (from v1, restyled) */
+  .source-badge {
+    @apply inline-flex items-center rounded-full px-1.5 py-0.5 text-[10px] font-medium leading-none;
+  }
+  .source-badge-kengetal { background: rgba(73, 62, 229, 0.12); color: #3a30b5; }
+  .source-badge-default  { background: rgba(21, 128, 61, 0.10); color: #15803d; }
+  .source-badge-csv      { background: rgba(180, 83, 9, 0.12); color: #b45309; }
+  .source-badge-manual   { background: rgba(220, 38, 38, 0.10); color: #b91c1c; }
+  .source-badge-api      { background: rgba(70, 69, 85, 0.10); color: var(--on-surface-variant); }
+
+  /* Override cell highlight — kept subtle */
+  .cell-override { background: rgba(180, 83, 9, 0.06); box-shadow: inset 0 0 0 1px rgba(180, 83, 9, 0.25); }
+}
