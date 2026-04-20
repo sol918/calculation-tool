@@ -1,12 +1,17 @@
 node_modules/
 .next/
-data/
 .env.local
 .env.*.local
 *.tsbuildinfo
 next-env.d.ts
 
-# Local-only: curl cookie jars + one-off migration scripts + stray Excel output.
+# DB: de live sqlite-file reist mee zodat de demo-projecten, kengetallen en
+# materialen direct beschikbaar zijn bij een fresh clone. De timestamped
+# `.backup-*` files blijven lokaal.
+data/*.backup-*
+data/backups/
+data/_*.xlsx
+
+# Local-only: curl cookie jars + Excel-export uit test-scripts.
 cookies*.txt
 temp_backups/
-*.xlsx
