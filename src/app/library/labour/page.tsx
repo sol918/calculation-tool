@@ -22,6 +22,7 @@ const FIELDS: FieldDef[] = [
   { key: "gezaagdPerM3",               label: "Gezaagd",             unit: "€/m³", group: "bouwpakket", hint: "Kosten per m³ gezaagd bouwpakket-hout" },
   { key: "cncSimpelPerM3",             label: "CNC simpel",          unit: "€/m³", group: "bouwpakket", hint: "Kosten per m³ CNC-bewerking (eenvoudig)" },
   { key: "cncComplexPerM3",            label: "CNC complex",         unit: "€/m³", group: "bouwpakket", hint: "Kosten per m³ CNC-bewerking (complex)" },
+  { key: "steenachtigPerM3",           label: "Steenachtig",         unit: "€/m³", group: "bouwpakket", hint: "Kosten per m³ steenachtig-bewerking (Fermacell + Cemvin, auto-afgeleid uit kengetallen)" },
 
   { key: "assemblageHourlyRate",       label: "Assemblagearbeid",    unit: "€/uur", group: "arbeid", hint: "Tarief voor de kengetallen 'Assemblagearbeid'" },
   { key: "installatieHourlyRate",      label: "Installatiearbeid",   unit: "€/uur", group: "arbeid", hint: "Tarief voor de kengetallen 'Installatiearbeid'" },

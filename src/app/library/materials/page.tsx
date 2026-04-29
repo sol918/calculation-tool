@@ -162,7 +162,12 @@ export default function MaterialsLibraryPage() {
                 className={`rounded-md border bg-white transition-colors ${dragOverGroup === g ? "border-primary bg-primary/5 ring-2 ring-primary/40" : ""}`}
                 onDragOver={(e) => {
                   if (!canEdit) return;
-                  if (Array.from(e.dataTransfer.types).includes("application/material-id")) {
+                  // Browsers verschillen in case-handling van custom MIME types tijdens
+                  // dragover. Normaliseer naar lowercase en accepteer ook text/plain
+                  // als fallback (sommige browsers blokkeren custom types tijdens
+                  // dragover om security-redenen — text/plain werkt overal).
+                  const types = Array.from(e.dataTransfer.types).map((t) => t.toLowerCase());
+                  if (types.includes("application/material-id") || types.includes("text/plain")) {
                     e.preventDefault();
                     e.dataTransfer.dropEffect = "move";
                     if (dragOverGroup !== g) setDragOverGroup(g);
@@ -175,7 +180,9 @@ export default function MaterialsLibraryPage() {
                 }}
                 onDrop={async (e) => {
                   if (!canEdit) return;
-                  const id = e.dataTransfer.getData("application/material-id");
+                  e.preventDefault();
+                  const id = e.dataTransfer.getData("application/material-id")
+                    || e.dataTransfer.getData("text/plain");
                   setDragOverGroup(null);
                   if (!id) return;
                   const m = materials.find((x) => x.id === id);
@@ -239,16 +246,22 @@ export default function MaterialsLibraryPage() {
                       ...list.map((m, idx) => (
                         <tr key={m.id} className={`${idx % 2 === 0 ? "bg-white" : "bg-gray-50/40"} hover:bg-blue-50/40`}>
                           {canEdit && (
-                            <td
-                              className="cursor-grab select-none text-center align-middle text-muted-foreground hover:text-foreground active:cursor-grabbing"
-                              draggable
-                              onDragStart={(e) => {
-                                e.dataTransfer.setData("application/material-id", m.id);
-                                e.dataTransfer.effectAllowed = "move";
-                              }}
-                              title="Sleep om naar een andere kostengroep te verplaatsen"
-                            >
-                              <GripVertical className="mx-auto h-3.5 w-3.5" />
+                            <td className="select-none text-center align-middle">
+                              <div
+                                className="inline-flex h-6 w-6 cursor-grab items-center justify-center text-muted-foreground hover:text-foreground active:cursor-grabbing"
+                                draggable
+                                onDragStart={(e) => {
+                                  // Zet beide MIME-types: custom voor zelf-detectie,
+                                  // text/plain als universele fallback voor browsers die
+                                  // custom types tijdens dragover verbergen.
+                                  e.dataTransfer.setData("application/material-id", m.id);
+                                  e.dataTransfer.setData("text/plain", m.id);
+                                  e.dataTransfer.effectAllowed = "move";
+                                }}
+                                title="Sleep om naar een andere kostengroep te verplaatsen"
+                              >
+                                <GripVertical className="h-3.5 w-3.5" />
+                              </div>
                             </td>
                           )}
                           <td className="px-2 py-1">

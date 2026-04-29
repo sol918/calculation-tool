@@ -5,7 +5,7 @@ import { getSessionUser } from "@/lib/auth/session";
 import { eq } from "drizzle-orm";
 
 const editableKeys = [
-  "gezaagdPerM3", "cncSimpelPerM3", "cncComplexPerM3",
+  "gezaagdPerM3", "cncSimpelPerM3", "cncComplexPerM3", "steenachtigPerM3",
   "assemblageHourlyRate", "installatieHourlyRate",
   "arbeidBuitenHourlyRate", "arbeidBuitenHoursPerModule",
   "projectmgmtHourlyRate", "projectmgmtHoursPerModule",

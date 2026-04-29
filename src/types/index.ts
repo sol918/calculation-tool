@@ -29,6 +29,19 @@ export type TransportGroup = "bouwpakket" | "assemblagehal";
 export type MarkupType = "percentage" | "fixed" | "per_m2";
 export type MarkupBasis = "group_direct" | "group_cumulative" | "totaal_ex_derden" | "inkoop_derden" | "grand_total" | "bouwpakket_plus_assemblage";
 
+export interface MaterialContribution {
+  /** Invoercategorie die dit materiaal aanstuurt (b.v. "Dichte gevel"). */
+  inputLabel: string;
+  /** Ratio uit de kengetal-rij (materiaal-eenheid per invoer-eenheid). */
+  ratio: number;
+  /** Hoeveelheid van de invoercategorie (m², m¹, stuks, …). */
+  inputQty: number;
+  /** Netto bijdrage (qty × ratio) in materiaal-eenheid. */
+  netto: number;
+  /** Optioneel — gebouwnaam bij project-brede aggregatie. */
+  buildingName?: string;
+}
+
 export interface MaterialCalcRow {
   material: Material;
   netto: number;
@@ -42,6 +55,10 @@ export interface MaterialCalcRow {
   laborHours: number;
   laborHoursBron: string;
   laborCost: number;
+  /** Per-invoercategorie breakdown — laat zien WAAR het materiaal vandaan komt
+   *  (welke kengetal-rijen het hebben gegenereerd). Leeg voor synthetische rijen
+   *  (Kolomcorrectie / S2P-stelposten). */
+  contributions?: MaterialContribution[];
 }
 
 export interface CategoryLabourEntry {
@@ -123,6 +140,17 @@ export interface ProjectCalcResult {
   arbeidBuitenCost: number;
   projectmgmtCost: number;
   totalModules: number;
+  /** Planning & projectmanagement formule-output (200×n^0,434 + 50×extra moduletypes). */
+  projectmgmtHours: number;
+  projectmgmtBaseHours: number;
+  projectmgmtTypePenaltyHours: number;
+  projectmgmtExponent: number;
+  distinctModuleTypes: number;
+  arbeidBuitenHours: number;
+  /** Project-niveau labour entries (PM, arbeid buiten) — geen kengetal-arbeid maar
+   *  project-brede overhead. Worden in de begroting onder "Arbeid" in Assemblagehal
+   *  getoond. Onder per-gebouw-scope proportioneel verdeeld o.b.v. modules. */
+  projectLevelLabour: CategoryLabourEntry[];
 
   totaalExDerden: number;  // bouwpakket + installateur + assemblagehal subtotals
   preProjectMarkups: number; // totaalExDerden + derden.subtotal + hoofdaannemer.subtotal
@@ -152,9 +180,9 @@ export interface SessionUser {
 export const MODULE_DERIVED_LABELS = {
   AREA: "Module oppervlak",   // Σ(L × W × count) m²
   COUNT: "Aantal modules",     // Σ(count) — interne totale telling; niet meer als standaard-categorie
-  COUNT_BG: "Module Aantal BG",       // modules op begane grond
-  COUNT_DAK: "Module Aantal Dak",     // modules met dakopbouw
-  COUNT_TUSSEN: "Module Aantal Tussenvd", // modules op tussenverdiepingen
+  COUNT_BG: "Modules begane grond",       // modules op begane grond
+  COUNT_DAK: "Modules dak",               // modules met dakopbouw
+  COUNT_TUSSEN: "Modules tussenverdieping", // modules op tussenverdiepingen
   WIDTH_TOTAL: "Module breedte totaal",   // Σ(W × count) m
   LENGTH_TOTAL: "Module lengte totaal",   // Σ(L × count) m
   HEIGHT_TOTAL: "Module hoogte totaal",   // Σ(H × count) m

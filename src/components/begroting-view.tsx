@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { formatEUR, formatEURsmart, formatNumber, formatQty, COST_GROUP_LABELS, BASIS_LABELS, computeAutoPolandTransport, computeLearningFactor, computeEngineering, computeKolomCorrectie, csvQtyForMaterial, computeBvo, DEFAULT_EFFICIENCY } from "@/lib/calculation";
-import { ChevronDown, ChevronRight, Plus, Trash2, Truck, Receipt, TrendingDown, Download, Settings, Wrench, Columns, FileSpreadsheet, Upload } from "lucide-react";
+import { ChevronDown, ChevronRight, Plus, Trash2, Truck, Receipt, TrendingDown, Download, Settings, Wrench, Columns, FileSpreadsheet, Upload, ClipboardList } from "lucide-react";
 import { BegrotingSunburst, THEME_COLORS, type SunburstNode } from "@/components/begroting-pie";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { TransportCalculator } from "@/components/transport-calculator";
@@ -16,7 +16,7 @@ import type {
 } from "@/types";
 
 type Scope = { mode: "all" } | { mode: "building"; buildingId: string };
-type Tab = "begroting" | "transport" | "efficientie" | "engineering" | "kolomcorrectie" | "csv";
+type Tab = "begroting" | "transport" | "efficientie" | "engineering" | "kolomcorrectie" | "csv" | "planning";
 
 interface Props { scope: Scope; density?: "normal" | "dense"; }
 
@@ -36,6 +36,13 @@ export function BegrotingView({ scope, density = "normal" }: Props) {
   const [expandedCats, setExpandedCats] = useState<Set<string>>(new Set());
   /** Per groep: klapt de "Arbeid per invoercategorie"-sectie open (default dicht). */
   const [expandedLabour, setExpandedLabour] = useState<Set<string>>(new Set());
+  /** Per materiaal-rij: toont de invoercategorie-bijdrage breakdown (1 niveau dieper). */
+  const [expandedMats, setExpandedMats] = useState<Set<string>>(new Set());
+  const toggleMat = (key: string) => setExpandedMats((prev) => {
+    const next = new Set(prev);
+    if (next.has(key)) next.delete(key); else next.add(key);
+    return next;
+  });
   const [effSettingsOpen, setEffSettingsOpen] = useState(false);
   const [effHover, setEffHover] = useState<{ cx: number; cy: number; label: string; color: string } | null>(null);
   const [transportTotal, setTransportTotal] = useState<number | null>(null);
@@ -245,9 +252,9 @@ export function BegrotingView({ scope, density = "normal" }: Props) {
       return out;
     }
 
-    /** Vouw "Module Aantal BG/Dak/Tussenvd [— suffix]" samen tot "Module Aantal [— suffix]". */
+    /** Vouw "Modules begane grond/dak/tussenverdieping [— suffix]" samen tot "Modules [— suffix]". */
     const collapseLabel = (label: string) =>
-      label.replace(/^Module Aantal (BG|Dak|Tussenvd)(\s—|$)/, "Module Aantal$2");
+      label.replace(/^Modules (begane grond|dak|tussenverdieping)(\s—|$)/, "Modules$2");
 
     const merged = new Map<string, CategoryLabourEntry>();
     for (const br of sources) {
@@ -272,6 +279,28 @@ export function BegrotingView({ scope, density = "normal" }: Props) {
             cost: e.cost * mult,
           });
         }
+      }
+    }
+    // Project-niveau labour (PM, arbeid-buiten) — staat buiten br.labourEntries omdat
+    // het projectbrede overhead is. In scope=all volledig tonen; in scope=building
+    // proportioneel verdelen op basis van modules van dit gebouw t.o.v. projecttotaal.
+    const plLabour = (calcResult?.projectLevelLabour ?? []).filter((e) => e.costGroup === g);
+    if (plLabour.length > 0) {
+      const ratio = isAll
+        ? 1
+        : (() => {
+            const total = calcResult?.totalModules ?? 0;
+            if (total <= 0 || !brForScope) return 0;
+            const here = brForScope.effectiveInputs["Aantal modules"] ?? 0;
+            return here / total;
+          })();
+      for (const e of plLabour) {
+        if (ratio <= 0) continue;
+        merged.set(e.inputLabel, {
+          ...e,
+          totalHours: e.totalHours * ratio,
+          cost: e.cost * ratio,
+        });
       }
     }
     return Array.from(merged.values()).sort((a, b) => b.cost - a.cost);
@@ -302,8 +331,12 @@ export function BegrotingView({ scope, density = "normal" }: Props) {
     ? calcResult.buildings.reduce((s, br) => s + engForBuilding(br).grandTotal * br.building.count, 0)
     : brForScope ? engForBuilding(brForScope).grandTotal : 0;
 
-  // Effectief subtotaal per groep op basis van disabled-set (zelfde logica als renderGroup).
-  function effectiveGroupSubtotal(g: GroupTotals): number {
+  // Effectieve directe kosten per groep (materiaal + arbeid + transport) ZONDER
+  // markups, met alle disabled-vinkjes toegepast. Vormt de basis voor de
+  // herberekening van cross-group markup-percentages (totaal_ex_derden, etc.) —
+  // anders blijft b.v. AK Assemblagehal 12,5% rekenen over installateur ook als
+  // de gebruiker installateur uitvinkt.
+  function effectiveGroupDirect(g: GroupTotals): number {
     if (isDisabled(`grp:${g.group}`)) return 0;
     const byCat = new Map<string, MaterialCalcRow[]>();
     for (const r of g.rows) {
@@ -318,19 +351,66 @@ export function BegrotingView({ scope, density = "normal" }: Props) {
         total += r.materialCost + r.laborCost;
       }
     }
-    // Labour-entries (bewerking voor bouwpakket, arbeid voor assemblagehal/installateur)
-    // zitten NIET in rows — tel ze hier apart op, tenzij de hele labour-sectie uit staat.
     if (!isDisabled(`labgroup:${g.group}`)) {
       const labEntries = labourEntriesForGroup(g.group);
       for (const e of labEntries) if (!isDisabled(`lab:${g.group}:${e.inputLabel}`)) total += e.cost;
     }
     if (!isDisabled(`tr:${g.group}`)) total += g.transportCost;
-    for (const m of g.markups) if (isMarkupEnabled(g.group, m.id)) total += m.amount;
+    return total;
+  }
+
+  // Berekenen op groepen die de huidige scope bevat. Wordt door de cross-group
+  // markup-bases (totaal_ex_derden / inkoop_derden / grand_total / bp+asm)
+  // gebruikt om hun bedragen te herberekenen na het uit/aan-zetten van groepen.
+  const groupsForBases: GroupTotals[] = isAll
+    ? calcResult.groups
+    : brForScope ? singleBuildingGroups(brForScope) : [];
+  const effectiveDirects: Record<CostGroup, number> = {
+    bouwpakket: 0, installateur: 0, assemblagehal: 0, derden: 0, hoofdaannemer: 0, arbeid: 0,
+  };
+  for (const g of groupsForBases) effectiveDirects[g.group] = effectiveGroupDirect(g);
+  const effTotaalExDerden = effectiveDirects.bouwpakket + effectiveDirects.installateur + effectiveDirects.assemblagehal;
+  const effInkoopDerden   = effectiveDirects.derden;
+  const effGrandTotal     = effTotaalExDerden + effInkoopDerden;
+  const effBpPlusAsm      = effectiveDirects.bouwpakket + effectiveDirects.assemblagehal;
+
+  /** Effectieve basis-bedrag voor een markup; gebruikt door tooltips/cellen om
+   *  consistent met effectiveMarkupAmount(m) te tonen. */
+  function effectiveBasisAmount(m: MarkupCalcRow): number {
+    switch (m.basis) {
+      case "totaal_ex_derden":          return effTotaalExDerden;
+      case "inkoop_derden":             return effInkoopDerden;
+      case "grand_total":               return effGrandTotal;
+      case "bouwpakket_plus_assemblage": return effBpPlusAsm;
+      default:                          return m.basisAmount;
+    }
+  }
+
+  /** Markup-bedrag herberekend op basis van de huidige disabled-vinkjes. Voor
+   *  group-locale bases (group_direct/group_cumulative) houden we de oorspronkelijke
+   *  m.amount aan — die hangt al van markup-volgorde af en wordt elders gerespecteerd. */
+  function effectiveMarkupAmount(m: MarkupCalcRow): number {
+    if (m.type !== "percentage") return m.amount;
+    const pct = m.value / 100;
+    switch (m.basis) {
+      case "totaal_ex_derden":          return effTotaalExDerden * pct;
+      case "inkoop_derden":             return effInkoopDerden * pct;
+      case "grand_total":               return effGrandTotal * pct;
+      case "bouwpakket_plus_assemblage": return effBpPlusAsm * pct;
+      default:                          return m.amount;
+    }
+  }
+
+  // Effectief subtotaal per groep op basis van disabled-set (zelfde logica als renderGroup).
+  function effectiveGroupSubtotal(g: GroupTotals): number {
+    if (isDisabled(`grp:${g.group}`)) return 0;
+    let total = effectiveGroupDirect(g);
+    for (const m of g.markups) if (isMarkupEnabled(g.group, m.id)) total += effectiveMarkupAmount(m);
     return total;
   }
 
   const scopedTotalExVat = (isAll
-    ? groupsToShow.reduce((s, g) => s + effectiveGroupSubtotal(g), 0) + (calcResult.projectMarkups.filter((m) => !isDisabled(`mk:${m.id}`)).reduce((s, m) => s + m.amount, 0))
+    ? groupsToShow.reduce((s, g) => s + effectiveGroupSubtotal(g), 0) + (calcResult.projectMarkups.filter((m) => !isDisabled(`mk:${m.id}`)).reduce((s, m) => s + effectiveMarkupAmount(m), 0))
     : brForScope ? groupsToShow.reduce((s, g) => s + effectiveGroupSubtotal(g), 0) : 0)
     + engineeringScoped;
 
@@ -354,26 +434,29 @@ export function BegrotingView({ scope, density = "normal" }: Props) {
     const totInclDer = totExDer + der;
     const bpPlusAsm = bp + asm;
 
-    // Hoofdaannemer-markups verdelen over groepen proportioneel.
+    // Hoofdaannemer-markups verdelen over groepen proportioneel. De m.amount
+    // wordt herberekend via effectiveMarkupAmount(m) zodat het sunburst-totaal
+    // gelijk loopt met scopedTotalExVat als groepen zijn uitgevinkt.
     const hoofdGroup = groupsForPie.find((g) => g.group === "hoofdaannemer");
     const shares: Record<string, number> = { bouwpakket: 0, installateur: 0, assemblagehal: 0, derden: 0 };
     if (hoofdGroup && !isDisabled(`grp:hoofdaannemer`)) {
       for (const m of hoofdGroup.markups) {
         if (!isMarkupEnabled("hoofdaannemer", m.id)) continue;
+        const amt = effectiveMarkupAmount(m);
         if (m.basis === "totaal_ex_derden" && totExDer > 0) {
-          shares.bouwpakket   += m.amount * (bp / totExDer);
-          shares.installateur += m.amount * (inst / totExDer);
-          shares.assemblagehal+= m.amount * (asm / totExDer);
+          shares.bouwpakket   += amt * (bp / totExDer);
+          shares.installateur += amt * (inst / totExDer);
+          shares.assemblagehal+= amt * (asm / totExDer);
         } else if (m.basis === "grand_total" && totInclDer > 0) {
-          shares.bouwpakket   += m.amount * (bp / totInclDer);
-          shares.installateur += m.amount * (inst / totInclDer);
-          shares.assemblagehal+= m.amount * (asm / totInclDer);
-          shares.derden       += m.amount * (der / totInclDer);
+          shares.bouwpakket   += amt * (bp / totInclDer);
+          shares.installateur += amt * (inst / totInclDer);
+          shares.assemblagehal+= amt * (asm / totInclDer);
+          shares.derden       += amt * (der / totInclDer);
         } else if (m.basis === "bouwpakket_plus_assemblage" && bpPlusAsm > 0) {
-          shares.bouwpakket    += m.amount * (bp / bpPlusAsm);
-          shares.assemblagehal += m.amount * (asm / bpPlusAsm);
+          shares.bouwpakket    += amt * (bp / bpPlusAsm);
+          shares.assemblagehal += amt * (asm / bpPlusAsm);
         } else if (m.basis === "inkoop_derden") {
-          shares.derden += m.amount;
+          shares.derden += amt;
         }
       }
     }
@@ -420,14 +503,15 @@ export function BegrotingView({ scope, density = "normal" }: Props) {
       if (g.transportCost > 0 && !isDisabled(`tr:${id}`)) {
         children.push({ id: `${id}:transport`, label: "Transport", value: g.transportCost });
       }
-      // Directe group-markups (AK+W&R voor derden, Marge bp/inst, etc.)
-      const enabledMarkups = g.markups.filter((m) => isMarkupEnabled(id, m.id) && m.amount > 0);
+      // Directe group-markups (AK+W&R voor derden, Marge bp/inst, etc.) — gebruikt
+      // effectiveMarkupAmount zodat ook hier disabled-state wordt gerespecteerd.
+      const enabledMarkups = g.markups.filter((m) => isMarkupEnabled(id, m.id) && effectiveMarkupAmount(m) > 0);
       if (enabledMarkups.length > 0) {
         children.push({
           id: `${id}:mk`,
           label: "Opslagen",
-          value: enabledMarkups.reduce((s, m) => s + m.amount, 0),
-          children: enabledMarkups.map((m) => ({ id: `mk:${m.id}`, label: m.name, value: m.amount })),
+          value: enabledMarkups.reduce((s, m) => s + effectiveMarkupAmount(m), 0),
+          children: enabledMarkups.map((m) => ({ id: `mk:${m.id}`, label: m.name, value: effectiveMarkupAmount(m) })),
         });
       }
       // Verdeelde hoofdaannemer-share
@@ -584,9 +668,9 @@ export function BegrotingView({ scope, density = "normal" }: Props) {
                     ) : <span />}
                   </td>
                   <td className="px-1 py-1 text-right tabular-nums text-muted-foreground">
-                    {src.type === "percentage" ? formatEUR(m.basisAmount) : ""}
+                    {src.type === "percentage" ? formatEUR(effectiveBasisAmount(m)) : ""}
                   </td>
-                  <td className="px-1 py-1 text-right font-medium tabular-nums">{formatEUR(m.amount)}</td>
+                  <td className="px-1 py-1 text-right font-medium tabular-nums">{formatEUR(effectiveMarkupAmount(m))}</td>
                   <td className="px-1 py-1">
                     {isAll && (
                       <Button variant="ghost" size="icon" className="h-6 w-6 text-destructive"
@@ -665,7 +749,7 @@ export function BegrotingView({ scope, density = "normal" }: Props) {
         for (const e of labEntries) if (!isDisabled(`lab:${g.group}:${e.inputLabel}`)) total += e.cost;
       }
       total += g.transportCost;
-      for (const m of g.markups) if (isMarkupEnabled(g.group, m.id)) total += m.amount;
+      for (const m of g.markups) if (isMarkupEnabled(g.group, m.id)) total += effectiveMarkupAmount(m);
       return total;
     })();
 
@@ -729,29 +813,92 @@ export function BegrotingView({ scope, density = "normal" }: Props) {
                           const matKey = `mat:${r.material.id}`;
                           const catOrGroupOff = catOff || groupOff;
                           const matOff = catOrGroupOff || isDisabled(matKey);
+                          // Aggregeer contributies per inputLabel (project-brede view kan
+                          // dezelfde label uit meerdere gebouwen hebben).
+                          const contribs = r.contributions ?? [];
+                          const aggMap = new Map<string, { inputQty: number; netto: number; ratios: Set<number> }>();
+                          for (const c of contribs) {
+                            const ex = aggMap.get(c.inputLabel);
+                            if (ex) {
+                              ex.inputQty += c.inputQty;
+                              ex.netto += c.netto;
+                              ex.ratios.add(c.ratio);
+                            } else {
+                              aggMap.set(c.inputLabel, { inputQty: c.inputQty, netto: c.netto, ratios: new Set([c.ratio]) });
+                            }
+                          }
+                          const matExpanded = expandedMats.has(matKey);
+                          const hasContribs = aggMap.size > 0;
                           return (
-                            <tr key={r.material.id} className={`border-t ${matOff ? "opacity-50" : ""}`}>
-                              <td className={`px-3 ${rowPadY}`}>
-                                <div className="flex items-center gap-1.5 truncate">
-                                  <input
-                                    type="checkbox"
-                                    checked={!isDisabled(matKey) && !catOrGroupOff}
-                                    disabled={catOrGroupOff}
-                                    onChange={(e) => setKeyDisabled(matKey, !e.target.checked)}
-                                    className="cursor-pointer"
-                                    style={accentStyle}
-                                    title={matOff ? "Weer meerekenen" : "Uitschakelen"}
-                                  />
-                                  <span className="truncate">{r.material.name}</span>
-                                  {r.material.description && (
-                                    <span className="truncate text-muted-foreground">— {r.material.description}</span>
-                                  )}
-                                </div>
-                              </td>
-                              <td className={`px-3 ${rowPadY} text-right tabular-nums`}>{formatQty(r.bruto)} {r.material.unit}</td>
-                              <td className={`px-3 ${rowPadY} text-right tabular-nums text-muted-foreground`}>{formatEURsmart(r.price)}</td>
-                              <td className={`px-3 ${rowPadY} text-right tabular-nums ${matOff ? "line-through opacity-60" : ""}`}>{formatEUR(r.materialCost)}</td>
-                            </tr>
+                            <React.Fragment key={r.material.id}>
+                              <tr className={`border-t ${matOff ? "opacity-50" : ""}`}>
+                                <td className={`px-3 ${rowPadY}`}>
+                                  <div className="flex items-center gap-1.5 truncate">
+                                    <input
+                                      type="checkbox"
+                                      checked={!isDisabled(matKey) && !catOrGroupOff}
+                                      disabled={catOrGroupOff}
+                                      onChange={(e) => setKeyDisabled(matKey, !e.target.checked)}
+                                      className="cursor-pointer"
+                                      style={accentStyle}
+                                      title={matOff ? "Weer meerekenen" : "Uitschakelen"}
+                                    />
+                                    {hasContribs ? (
+                                      <button
+                                        onClick={() => toggleMat(matKey)}
+                                        className="flex flex-1 items-center gap-1.5 truncate text-left hover:opacity-80"
+                                        title={matExpanded ? "Inklappen" : "Toon herkomst (per invoercategorie)"}
+                                      >
+                                        {matExpanded ? <ChevronDown className="h-3 w-3 shrink-0" /> : <ChevronRight className="h-3 w-3 shrink-0" />}
+                                        <span className="truncate">{r.material.name}</span>
+                                        {r.material.description && (
+                                          <span className="truncate text-muted-foreground">— {r.material.description}</span>
+                                        )}
+                                      </button>
+                                    ) : (
+                                      <>
+                                        <span className="w-3 shrink-0" />
+                                        <span className="truncate">{r.material.name}</span>
+                                        {r.material.description && (
+                                          <span className="truncate text-muted-foreground">— {r.material.description}</span>
+                                        )}
+                                      </>
+                                    )}
+                                  </div>
+                                </td>
+                                <td className={`px-3 ${rowPadY} text-right tabular-nums`}>{formatQty(r.bruto)} {r.material.unit}</td>
+                                <td className={`px-3 ${rowPadY} text-right tabular-nums text-muted-foreground`}>{formatEURsmart(r.price)}</td>
+                                <td className={`px-3 ${rowPadY} text-right tabular-nums ${matOff ? "line-through opacity-60" : ""}`}>{formatEUR(r.materialCost)}</td>
+                              </tr>
+                              {matExpanded && hasContribs && (
+                                <tr className="bg-gray-50/60">
+                                  <td colSpan={4} className="px-3 py-1.5">
+                                    <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                                      Herkomst per invoercategorie
+                                    </div>
+                                    <div className="mt-1 grid grid-cols-[1fr_auto_auto_auto] gap-x-3 gap-y-0.5 text-[11px]">
+                                      {Array.from(aggMap.entries()).sort((a, b) => b[1].netto - a[1].netto).map(([label, c]) => {
+                                        const ratioStr = c.ratios.size === 1
+                                          ? `× ${formatNumber(Array.from(c.ratios)[0], 4)}`
+                                          : `× ${Array.from(c.ratios).map((x) => formatNumber(x, 4)).join("/")}`;
+                                        const lossPart = r.loss > 0 ? ` × ${formatNumber(1 + r.loss, 2)} verlies` : "";
+                                        const cost = c.netto * (1 + r.loss) * r.price;
+                                        return (
+                                          <React.Fragment key={label}>
+                                            <span className="truncate text-muted-foreground">↳ {label}</span>
+                                            <span className="text-right tabular-nums text-muted-foreground">
+                                              {formatQty(c.inputQty)}{lossPart ? "" : ""} {ratioStr}
+                                            </span>
+                                            <span className="text-right tabular-nums">{formatQty(c.netto * (1 + r.loss))} {r.material.unit}</span>
+                                            <span className="text-right tabular-nums">{formatEUR(cost)}</span>
+                                          </React.Fragment>
+                                        );
+                                      })}
+                                    </div>
+                                  </td>
+                                </tr>
+                              )}
+                            </React.Fragment>
                           );
                         })}
                       </tbody>
@@ -911,14 +1058,17 @@ export function BegrotingView({ scope, density = "normal" }: Props) {
     const src = markupById.get(m.id);
     if (!src) return null;
     const suffix = src.type === "percentage" ? "%" : src.type === "per_m2" ? "€/m²" : "€";
-    // Tooltip: leg uit waarover het percentage berekend is.
+    // Tooltip: leg uit waarover het percentage berekend is. Bedragen volgen de
+    // effective basis (na uit/aan-vinkjes), niet de oorspronkelijke calc-waarde.
     const basisLabel = BASIS_LABELS[m.basis] ?? m.basis;
+    const effAmount = effectiveMarkupAmount(m);
+    const effBasis = effectiveBasisAmount(m);
     const basisHint =
       src.type === "percentage"
-        ? `${src.value}% × ${formatEUR(m.basisAmount)} (${basisLabel}) = ${formatEUR(m.amount)}`
+        ? `${src.value}% × ${formatEUR(effBasis)} (${basisLabel}) = ${formatEUR(effAmount)}`
         : src.type === "per_m2"
-          ? `€${src.value}/m² × ${formatQty(m.basisAmount)} m² = ${formatEUR(m.amount)}`
-          : `vast bedrag: ${formatEUR(m.amount)}`;
+          ? `€${src.value}/m² × ${formatQty(effBasis)} m² = ${formatEUR(effAmount)}`
+          : `vast bedrag: ${formatEUR(effAmount)}`;
     const mkKey = `mk:${m.id}`;
     const mkOff = isDisabled(mkKey);
     return (
@@ -958,7 +1108,7 @@ export function BegrotingView({ scope, density = "normal" }: Props) {
           />
           <span className="w-8 text-[10px] text-muted-foreground">{suffix}</span>
         </span>
-        <span className={`w-24 text-right tabular-nums ${mkOff ? "line-through opacity-60" : ""}`}>{formatEUR(m.amount)}</span>
+        <span className={`w-24 text-right tabular-nums ${mkOff ? "line-through opacity-60" : ""}`}>{formatEUR(effAmount)}</span>
       </React.Fragment>
     );
   }
@@ -1002,11 +1152,6 @@ export function BegrotingView({ scope, density = "normal" }: Props) {
               </Button>
             </span>
           )}
-        </div>
-        {/* Subtotaal — full-width border zodat de lijn niet onderbreekt tussen kolommen. */}
-        <div className="mt-1.5 flex items-center justify-between border-t pt-1.5 text-sm font-semibold">
-          <span>{!isAll ? `${label} (1×)` : `Subtotaal ${label.toLowerCase()}`}</span>
-          <span className="tabular-nums">{formatEUR(g.subtotal)}</span>
         </div>
       </div>
     );
@@ -1470,6 +1615,153 @@ export function BegrotingView({ scope, density = "normal" }: Props) {
     );
   }
 
+  function renderPlanningTab() {
+    const totalModules = calcResult!.totalModules;
+    const distinctTypes = calcResult!.distinctModuleTypes;
+    const baseHours = calcResult!.projectmgmtBaseHours;
+    const penaltyHours = calcResult!.projectmgmtTypePenaltyHours;
+    const totalHours = calcResult!.projectmgmtHours;
+    const exponent = calcResult!.projectmgmtExponent;
+    const hourlyRate = data.labourRates?.projectmgmtHourlyRate ?? 85;
+    const totalCost = calcResult!.projectmgmtCost;
+
+    // Chart-dimensies — zelfde stijl als Efficiëntie-tab.
+    const W = 640, H = 240, padL = 50, padR = 80, padT = 16, padB = 28;
+    const xMin = 1, xMax = Math.max(1000, totalModules * 1.2);
+    const yMax = 200 * Math.pow(xMax, exponent) * 1.1;
+    // Log-x mapping
+    const logX = (n: number) => Math.log10(Math.max(1, n));
+    const xForN = (n: number) => padL + (logX(n) - logX(xMin)) / (logX(xMax) - logX(xMin)) * (W - padL - padR);
+    const yForH = (h: number) => padT + (1 - h / yMax) * (H - padT - padB);
+    // Curve: 200 punten log-spaced
+    const curvePts = Array.from({ length: 200 }, (_, i) => {
+      const t = i / 199;
+      const n = Math.pow(10, logX(xMin) + t * (logX(xMax) - logX(xMin)));
+      return `${xForN(n).toFixed(2)},${yForH(200 * Math.pow(n, exponent)).toFixed(2)}`;
+    }).join(" ");
+
+    const xTicks = [1, 10, 100, 1000].filter((n) => n <= xMax);
+    const yTicks = [0, Math.round(yMax * 0.25), Math.round(yMax * 0.5), Math.round(yMax * 0.75), Math.round(yMax)];
+
+    return (
+      <div className="space-y-3">
+        <div className="rounded-md border bg-white">
+          <div className="border-b px-3 py-2 text-xs font-semibold">Projectmanagement</div>
+          <div className="space-y-1.5 px-3 py-2.5 text-xs">
+            <p className="text-muted-foreground">
+              Eén vaste formule, gebaseerd op aantal modules en aantal unieke moduletypes:
+            </p>
+            <div className="rounded bg-gray-50 px-2 py-1.5 font-mono text-[11px] text-gray-800">
+              uren = 200 × n<sup>0,434</sup> + 50 × max(0, types − 1)
+            </div>
+            <p className="text-[11px] text-muted-foreground">
+              Anchor-punten basis-deel: 1 → 200u · 10 → ~543u · 100 → ~1.480u · 1000 → 4.000u.
+              Elke extra moduletype na de eerste voegt 50u toe voor herhaal-engineering en setup.
+            </p>
+          </div>
+        </div>
+
+        <div className="rounded-md border bg-white">
+          <div className="border-b px-3 py-2 text-xs font-semibold">Invoer</div>
+          <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 px-3 py-2 text-xs md:grid-cols-3">
+            <Stat label="Totaal modules"      value={formatNumber(totalModules, 0)} unit="stuks" />
+            <Stat label="Unieke moduletypes"  value={distinctTypes}                  unit="types" />
+            <Stat label="Uurtarief"           value={formatEUR(hourlyRate)}          unit="/uur" />
+          </div>
+        </div>
+
+        <div className="rounded-md border bg-white">
+          <div className="border-b px-3 py-2 text-xs font-semibold">Berekening</div>
+          <table className="w-full text-xs">
+            <tbody className="[&>tr>td]:px-3 [&>tr>td]:py-1.5 [&>tr]:border-b last:[&>tr]:border-0">
+              <tr>
+                <td className="text-muted-foreground">Basis (200 × n<sup>0,434</sup>)</td>
+                <td className="text-right tabular-nums">{formatNumber(baseHours, 0)}</td>
+                <td className="w-12 text-muted-foreground">u</td>
+              </tr>
+              <tr>
+                <td className="text-muted-foreground">Penalty moduletypes (50u × {Math.max(0, distinctTypes - 1)})</td>
+                <td className="text-right tabular-nums">{formatNumber(penaltyHours, 0)}</td>
+                <td className="text-muted-foreground">u</td>
+              </tr>
+              <tr className="bg-gray-50/70 font-medium">
+                <td>Totaal uren</td>
+                <td className="text-right tabular-nums">{formatNumber(totalHours, 0)}</td>
+                <td className="text-muted-foreground">u</td>
+              </tr>
+              <tr>
+                <td className="text-muted-foreground">× uurtarief</td>
+                <td className="text-right tabular-nums">{formatEUR(hourlyRate)}</td>
+                <td className="text-muted-foreground">/uur</td>
+              </tr>
+              <tr className="font-semibold">
+                <td>Kosten projectmanagement</td>
+                <td className="text-right text-base tabular-nums">{formatEUR(totalCost)}</td>
+                <td />
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div className="rounded-md border bg-white p-3">
+          <div className="mb-2 text-xs font-semibold">PM-curve · uren vs. aantal modules (log-schaal)</div>
+          <svg viewBox={`0 0 ${W} ${H}`} className="h-auto w-full">
+            {/* Axes */}
+            <line x1={padL} y1={padT} x2={padL} y2={H - padB} stroke="#d1d5db" />
+            <line x1={padL} y1={H - padB} x2={W - padR} y2={H - padB} stroke="#d1d5db" />
+
+            {/* Y-grid + labels */}
+            {yTicks.map((h) => (
+              <g key={`y-${h}`}>
+                <line x1={padL} y1={yForH(h)} x2={W - padR} y2={yForH(h)} stroke="#f3f4f6" />
+                <text x={padL - 4} y={yForH(h) + 3} textAnchor="end" fontSize="9" fill="#6b7280">
+                  {formatNumber(h, 0)}
+                </text>
+              </g>
+            ))}
+
+            {/* X-ticks (log) */}
+            {xTicks.map((n) => (
+              <g key={`x-${n}`}>
+                <line x1={xForN(n)} y1={H - padB} x2={xForN(n)} y2={H - padB + 3} stroke="#9ca3af" />
+                <text x={xForN(n)} y={H - padB + 14} textAnchor="middle" fontSize="9" fill="#6b7280">
+                  {n}
+                </text>
+              </g>
+            ))}
+            <text x={W - padR + 4} y={H - padB + 4} fontSize="9" fill="#6b7280">modules →</text>
+            <text x={padL - 30} y={padT + 4} fontSize="9" fill="#6b7280">uren</text>
+
+            {/* Curve */}
+            <polyline points={curvePts} fill="none" stroke="#493ee5" strokeWidth="1.5" />
+
+            {/* Marker op huidig project */}
+            {totalModules > 0 && (() => {
+              const x = xForN(totalModules);
+              const y = yForH(baseHours);
+              return (
+                <g>
+                  <line x1={x} y1={padT} x2={x} y2={H - padB} stroke="#9ca3af" strokeDasharray="3 3" strokeWidth="1" />
+                  <line x1={padL} y1={y} x2={W - padR} y2={y} stroke="#9ca3af" strokeDasharray="3 3" strokeWidth="1" />
+                  <circle cx={x} cy={y} r="4" fill="#493ee5" stroke="#fff" strokeWidth="1.5" />
+                  <text x={x + 8} y={y - 6} fontSize="10" fill="#374151">
+                    {totalModules} modules · {formatNumber(baseHours, 0)} u
+                  </text>
+                </g>
+              );
+            })()}
+          </svg>
+        </div>
+
+        <p className="text-[11px] text-muted-foreground">
+          De pm-kosten worden automatisch in <strong>Assemblagehal &gt; Arbeid</strong> meegenomen
+          als regel "Projectmanagement". Pas het uurtarief aan via{" "}
+          <a className="underline" href={`/library/labour?project=${data.project?.id ?? ""}`}>Arbeid &amp; tarieven</a>.
+        </p>
+      </div>
+    );
+  }
+
   function renderKolomCorrectieTab() {
     if (!brForScope) return <div className="text-sm text-muted-foreground">Kies een gebouw om de kolomcorrectie te bekijken.</div>;
     const mods = data.modules.get(brForScope.building.id) ?? [];
@@ -1887,11 +2179,19 @@ export function BegrotingView({ scope, density = "normal" }: Props) {
                 project={data.project}
                 scope={scope}
                 onProjectChange={data.refetch}
-                onTotalChange={(total) => {
-                  setTransportTotal(total);
-                  // Schrijf door naar de layout-context → assemblagehal.transportCost.
-                  // Alleen bij scope "all" zodat we niet partieel gaan tellen.
-                  if (scope.mode === "all") setAutoAssemblageTransport(total);
+                onScopeTotal={(total) => setTransportTotal(total)}
+                onProjectTotal={(total) => {
+                  // Schrijf project-brede waarde door naar de layout-context →
+                  // assemblagehal.transportCost. Wordt ALTIJD geëmit, ook in
+                  // single-building scope (TransportCalculator vuurt dan een
+                  // extra project-brede POST). Server persist sync in DB.
+                  if (total != null) {
+                    setAutoAssemblageTransport(total);
+                    // Refetch zodat data.project.autoAssemblageTransportCost
+                    // ook in sync komt — anders zou hydrate later kunnen
+                    // terugvallen op een oude DB-waarde.
+                    data.refetch();
+                  }
                 }}
               />
             </div>
@@ -2023,6 +2323,7 @@ export function BegrotingView({ scope, density = "normal" }: Props) {
       <div className="flex items-end gap-1 border-b border-gray-200 pl-1">
         <TabPill active={tab === "begroting"}   onClick={() => setTab("begroting")}   icon={<Receipt className="h-3 w-3" />}     label="Begroting" />
         <TabPill active={tab === "transport"}   onClick={() => setTab("transport")}   icon={<Truck className="h-3 w-3" />}       label="Transport" />
+        <TabPill active={tab === "planning"}    onClick={() => setTab("planning")}    icon={<ClipboardList className="h-3 w-3" />} label="PM" />
         {!isAll && (
           <TabPill active={tab === "efficientie"} onClick={() => setTab("efficientie")} icon={<TrendingDown className="h-3 w-3" />} label="Efficiëntie" />
         )}
@@ -2035,15 +2336,22 @@ export function BegrotingView({ scope, density = "normal" }: Props) {
         {!isAll && (
           <TabPill active={tab === "csv"} onClick={() => setTab("csv")} icon={<FileSpreadsheet className="h-3 w-3" />} label="CSV override" />
         )}
-        {tab === "begroting" && data.project && (
-          <a
-            href={`/api/projects/${data.project.id}/export`}
-            className="mb-1 ml-auto flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs text-gray-500 hover:bg-gray-100 hover:text-gray-900"
-            title="Download de begroting als Excel"
-          >
-            <Download className="h-3 w-3" /> Excel
-          </a>
-        )}
+        {tab === "begroting" && data.project && (() => {
+          // Stuur disabled-keys mee als query-param zodat de Excel-export dezelfde
+          // aan/uit-state respecteert als wat hier op het scherm staat.
+          const disabledParam = disabledKeys.size > 0
+            ? `?disabled=${encodeURIComponent(Array.from(disabledKeys).join(","))}`
+            : "";
+          return (
+            <a
+              href={`/api/projects/${data.project.id}/export${disabledParam}`}
+              className="mb-1 ml-auto flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs text-gray-500 hover:bg-gray-100 hover:text-gray-900"
+              title="Download de begroting als Excel — respecteert je aan/uit-vinkjes"
+            >
+              <Download className="h-3 w-3" /> Excel
+            </a>
+          );
+        })()}
       </div>
 
       {/* Content-paneel — rondom de active tab: zelfde bg-white, geen top-border
@@ -2114,6 +2422,7 @@ export function BegrotingView({ scope, density = "normal" }: Props) {
       )}
 
       {tab === "transport" && (<div className="p-3">{renderTransportTab()}</div>)}
+      {tab === "planning" && (<div className="p-3">{renderPlanningTab()}</div>)}
       {tab === "efficientie" && (<div className="p-3">{renderEfficiencyTab()}</div>)}
       {tab === "engineering" && (<div className="p-3">{renderEngineeringTab()}</div>)}
       {tab === "kolomcorrectie" && (<div className="p-3">{renderKolomCorrectieTab()}</div>)}

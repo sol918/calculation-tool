@@ -9,6 +9,7 @@ next-env.d.ts
 # materialen direct beschikbaar zijn bij een fresh clone. De timestamped
 # `.backup-*` files blijven lokaal.
 data/*.backup-*
+data/*.backup.*
 data/backups/
 data/_*.xlsx
 

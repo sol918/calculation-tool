@@ -242,6 +242,8 @@ async function seed() {
     { table: "kengetal_labour", col: "cnc_complex_m3_per_input", def: "REAL NOT NULL DEFAULT 0" },
     { table: "kengetal_labour", col: "steenachtig_m3_per_input", def: "REAL NOT NULL DEFAULT 0" },
     { table: "kengetal_labour", col: "installatie_hrs_per_input", def: "REAL NOT NULL DEFAULT 0" },
+    { table: "kengetal_labour", col: "arbeid_buiten_hrs_per_input", def: "REAL NOT NULL DEFAULT 0" },
+    { table: "kengetal_labour", col: "projectmgmt_hrs_per_input", def: "REAL NOT NULL DEFAULT 0" },
     { table: "labour_rates",    col: "steenachtig_per_m3",        def: "REAL NOT NULL DEFAULT 250" },
     { table: "kengetal_sets", col: "eff_vat_huidig", def: "REAL NOT NULL DEFAULT 0.45" },
     { table: "kengetal_sets", col: "eff_vat_max", def: "REAL NOT NULL DEFAULT 0.75" },
@@ -249,6 +251,7 @@ async function seed() {
     { table: "kengetal_sets", col: "eff_n_ref", def: "REAL NOT NULL DEFAULT 10" },
     { table: "labour_rates", col: "arbeid_buiten_hours_base", def: "REAL NOT NULL DEFAULT 0" },
     { table: "labour_rates", col: "projectmgmt_hours_base",   def: "REAL NOT NULL DEFAULT 200" },
+    { table: "projects",     col: "auto_assemblage_transport_cost", def: "REAL NOT NULL DEFAULT 0" },
   ];
   // Rename verouderde _hrs_per_input bewerkings-kolommen → _m3_per_input (idempotent).
   // Voer VÓÓR ADD COLUMN uit: anders maken we nieuwe kolommen terwijl de oude blijven.
@@ -286,6 +289,10 @@ async function seed() {
     { from: "Lengte totaal",            to: "Module lengte totaal" },
     { from: "Breedte totaal",           to: "Module breedte totaal" },
     { from: "Hoogte totaal",            to: "Module hoogte totaal" },
+    // Module-aantal labels: lees-vriendelijk, geen afkortingen meer.
+    { from: "Module Aantal BG",          to: "Modules begane grond" },
+    { from: "Module Aantal Dak",         to: "Modules dak" },
+    { from: "Module Aantal Tussenvd",    to: "Modules tussenverdieping" },
   ];
   for (const { from, to } of labelRenames) {
     try { await client.execute({ sql: "UPDATE kengetal_rows SET input_label = ? WHERE input_label = ?", args: [to, from] }); } catch {}
@@ -295,6 +302,102 @@ async function seed() {
   // Verwijder het oude "Opp begane grond" kengetal-label uit building_inputs
   // (de UI-waarde wordt nu alleen in de composite `_opp_begane_grond` bewaard).
   try { await client.execute("DELETE FROM building_inputs WHERE input_label = 'Opp begane grond'"); } catch {}
+
+  // Eénmalige badkamer-reparatie: voor elk gebouw waar enige composite
+  // `_bk_klein/_bk_midden/_bk_groot` bestaat, is die set de bron van waarheid.
+  // We synchroniseren ALLE drie canonical labels ("Badkamers klein/midden/groot")
+  // met de composite-waarden (0 waar composite ontbreekt) — zo worden ook stale
+  // canonical-rijen uit oudere migraties opgeruimd. Idempotent.
+  try {
+    const bkComps = ["_bk_klein", "_bk_midden", "_bk_groot"] as const;
+    const bkCanon: Record<typeof bkComps[number], string> = {
+      _bk_klein:  "Badkamers klein",
+      _bk_midden: "Badkamers midden",
+      _bk_groot:  "Badkamers groot",
+    };
+    const buildingsWithComposite = await client.execute(
+      "SELECT DISTINCT building_id FROM building_inputs WHERE input_label IN ('_bk_klein','_bk_midden','_bk_groot')"
+    );
+    let bkRepaired = 0;
+    for (const row of buildingsWithComposite.rows) {
+      const buildingId = row.building_id as string;
+      const compValues: Record<typeof bkComps[number], number> = { _bk_klein: 0, _bk_midden: 0, _bk_groot: 0 };
+      for (const comp of bkComps) {
+        const r = await client.execute({
+          sql: "SELECT quantity FROM building_inputs WHERE building_id = ? AND input_label = ?",
+          args: [buildingId, comp],
+        });
+        if (r.rows.length > 0) compValues[comp] = r.rows[0].quantity as number;
+      }
+      for (const comp of bkComps) {
+        const canon = bkCanon[comp];
+        const qty = compValues[comp];
+        const existing = await client.execute({
+          sql: "SELECT id, quantity FROM building_inputs WHERE building_id = ? AND input_label = ?",
+          args: [buildingId, canon],
+        });
+        if (existing.rows.length > 0) {
+          const cur = existing.rows[0].quantity as number;
+          if (cur !== qty) {
+            await client.execute({
+              sql: "UPDATE building_inputs SET quantity = ? WHERE id = ?",
+              args: [qty, existing.rows[0].id as string],
+            });
+            bkRepaired++;
+          }
+        } else if (qty > 0) {
+          await client.execute({
+            sql: "INSERT INTO building_inputs (id, building_id, input_label, quantity) VALUES (?, ?, ?, ?)",
+            args: [crypto.randomUUID(), buildingId, canon, qty],
+          });
+          bkRepaired++;
+        }
+      }
+    }
+    if (bkRepaired > 0) console.log(`  Repaired ${bkRepaired} badkamer canonical-vs-composite mismatches.`);
+  } catch (e) { console.log("  Badkamer-reparatie skipped:", (e as Error).message); }
+
+  // WSW-reparatie (.optop): composite `_wsw_korte_m1` / `_wsw_lange_m1` is bron
+  // van waarheid; sync de canonical "WSW korte zijde"/"WSW lange zijde" labels
+  // per gebouw met die composites. Idempotent.
+  try {
+    const wswPairs: { comp: string; canon: string }[] = [
+      { comp: "_wsw_korte_m1", canon: "WSW korte zijde" },
+      { comp: "_wsw_lange_m1", canon: "WSW lange zijde" },
+    ];
+    let wswRepaired = 0;
+    for (const { comp, canon } of wswPairs) {
+      const composites = await client.execute({
+        sql: "SELECT building_id, quantity FROM building_inputs WHERE input_label = ?",
+        args: [comp],
+      });
+      for (const row of composites.rows) {
+        const buildingId = row.building_id as string;
+        const qty = row.quantity as number;
+        const existing = await client.execute({
+          sql: "SELECT id, quantity FROM building_inputs WHERE building_id = ? AND input_label = ?",
+          args: [buildingId, canon],
+        });
+        if (existing.rows.length > 0) {
+          const cur = existing.rows[0].quantity as number;
+          if (cur !== qty) {
+            await client.execute({
+              sql: "UPDATE building_inputs SET quantity = ? WHERE id = ?",
+              args: [qty, existing.rows[0].id as string],
+            });
+            wswRepaired++;
+          }
+        } else if (qty > 0) {
+          await client.execute({
+            sql: "INSERT INTO building_inputs (id, building_id, input_label, quantity) VALUES (?, ?, ?, ?)",
+            args: [crypto.randomUUID(), buildingId, canon, qty],
+          });
+          wswRepaired++;
+        }
+      }
+    }
+    if (wswRepaired > 0) console.log(`  Repaired ${wswRepaired} WSW canonical-vs-composite mismatches.`);
+  } catch (e) { console.log("  WSW-reparatie skipped:", (e as Error).message); }
 
   // Voordeuren en binnendeuren: verplaats de bestaande kengetal-regels van
   // "Aantal modules × ratio" naar de juiste telling-input ("Aantal voordeuren"
@@ -368,6 +471,57 @@ async function seed() {
     inserted++;
   }
   if (inserted > 0) console.log(`  Added ${inserted} I-joist materials.`);
+
+  // S2P prefab-badkamer stelposten — 4 stuk-materialen die de kengetal-regels voor
+  // sanitair/waterleiding/badkamers/los toilet vervangen wanneer het S2P-vinkje aan staat.
+  const s2pMaterials: { code: string; name: string; price: number }[] = [
+    { code: "S2PT",    name: "S2P los toilet",        price: 2000 },
+    { code: "S2PBK_S", name: "S2P badkamer klein",    price: 7000 },
+    { code: "S2PBK_M", name: "S2P badkamer midden",   price: 9000 },
+    { code: "S2PBK_L", name: "S2P badkamer groot",    price: 11000 },
+  ];
+  let s2pInserted = 0;
+  for (const s of s2pMaterials) {
+    if (existingCodes.has(s.code)) continue;
+    await db.insert(schema.materials).values({
+      code: s.code,
+      name: s.name,
+      description: "Prefab badkamer-unit (S2P stelpost). Vervangt kengetal-rijen voor sanitair, waterleiding en badkamer-/toiletarbeid.",
+      unit: "stuks",
+      category: "Prefab badkamer",
+      costGroup: "derden",
+      pricePerUnit: s.price,
+      lossPct: 0,
+      laborHours: 0,
+    });
+    s2pInserted++;
+  }
+  if (s2pInserted > 0) console.log(`  Added ${s2pInserted} S2P stelpost materials.`);
+  // Reparatie: S2P-materialen die eerder in 'installateur' waren gezet → naar 'derden' (inkoop derden).
+  try {
+    const moved = await client.execute({
+      sql: "UPDATE materials SET cost_group = 'derden' WHERE code IN ('S2PT','S2PBK_S','S2PBK_M','S2PBK_L') AND cost_group <> 'derden'",
+    });
+    if ((moved.rowsAffected ?? 0) > 0) console.log(`  Moved ${moved.rowsAffected} S2P materials to 'derden' cost-group.`);
+  } catch {}
+
+  // Categorie-correctie: TAPE (Luchtdichte tape) hoort bij Luchtdichting, niet bij Folies.
+  try {
+    const moved = await client.execute({
+      sql: "UPDATE materials SET category = 'Luchtdichting' WHERE code = 'TAPE' AND category <> 'Luchtdichting'",
+    });
+    if ((moved.rowsAffected ?? 0) > 0) console.log(`  Recategorised TAPE → Luchtdichting.`);
+  } catch {}
+
+  // Verwijder de "Correctiefactor inefficiëntie" markup uit alle projecten — de
+  // inefficiëntie zit al in de DeJong-leercurve op de arbeidsuren, dus dit was
+  // een dubbeltelling. Idempotent.
+  try {
+    const removed = await client.execute({
+      sql: "DELETE FROM markup_rows WHERE name = 'Correctiefactor inefficiëntie'",
+    });
+    if ((removed.rowsAffected ?? 0) > 0) console.log(`  Removed ${removed.rowsAffected} 'Correctiefactor inefficiëntie' markup rows.`);
+  } catch {}
 
   // Zorg dat elk project de standaard opslagen heeft (idempotent per (project, costGroup, name)).
   const projectsRes = await client.execute("SELECT id FROM projects");

@@ -85,6 +85,14 @@ export const kengetalLabour = sqliteTable("kengetal_labour", {
   hoursPerInput: real("hours_per_input").notNull().default(0),
   /** Installatiearbeid — uren/eenheid. Valt in de 'installateur'-kostengroep. */
   installatieHoursPerInput: real("installatie_hrs_per_input").notNull().default(0),
+  /** Arbeid buiten — uren/eenheid. Valt in de 'assemblagehal'-kostengroep, geprijsd
+   *  tegen labour_rates.arbeidBuitenHourlyRate. Naast de project-brede module-driven
+   *  uren (arbeidBuitenHoursPerModule + arbeidBuitenHoursBase) — die blijven bestaan. */
+  arbeidBuitenHrsPerInput: real("arbeid_buiten_hrs_per_input").notNull().default(0),
+  /** Projectmanagement — uren/eenheid. Valt in de 'assemblagehal'-kostengroep,
+   *  geprijsd tegen labour_rates.projectmgmtHourlyRate. Naast de project-brede
+   *  module-driven uren (projectmgmtHoursPerModule + projectmgmtHoursBase). */
+  projectmgmtHrsPerInput: real("projectmgmt_hrs_per_input").notNull().default(0),
   // Bouwpakket-bewerking: m³ bewerkt bouwpakket per categorie-invoer-eenheid.
   // Som van gezaagd+cncSimpel+cncComplex hoort gelijk te zijn aan het totale
   // bouwpakket-m³/eenheid (gesommeerd uit de kengetal-rijen). Kramerijen is altijd
@@ -135,6 +143,11 @@ export const projects = sqliteTable("projects", {
   extraTripCost: real("extra_trip_cost").notNull().default(0),
   // Als true: aantal extra transporten = floor(totalTrucks × 0.05). Als false: gebruik extraTripsCount.
   extraTripsAuto: integer("extra_trips_auto", { mode: "boolean" }).notNull().default(true),
+  // Persisted laatste totaal-kost van de auto-assemblagehal-transport berekening
+  // (`/api/transport/calculate` zonder buildingId). Hierdoor mist de begroting nooit
+  // de assemblage-transport-post bij een page-reload, ook als de achtergrond-fetch nog
+  // niet klaar is of geocoding faalt — we laten zien wat we de laatste keer hadden.
+  autoAssemblageTransportCost: real("auto_assemblage_transport_cost").notNull().default(0),
   notes: text("notes"),
   createdAt: text("created_at").$defaultFn(() => new Date().toISOString()),
 });

@@ -90,6 +90,13 @@ export function useCalculation({
       gfaByBuildingId.set(br.building.id, computeBvo(br.effectiveInputs, setName));
     }
 
-    return calculateProject(project, buildingResults, transport, markupRows, rates, "Module oppervlak", projLearn, gfaByBuildingId, autoAssemblageTransport ?? 0);
+    // Aantal unieke moduletypes (L|W|H tuples) over het hele project. Drijft de
+    // type-penalty in de PM-formule (50u extra per type na de eerste).
+    const moduleTypeKeys = new Set<string>();
+    for (const b of buildings) {
+      const mods = modules.get(b.id) ?? [];
+      for (const m of mods) moduleTypeKeys.add(`${m.lengthM}|${m.widthM}|${m.heightM}`);
+    }
+    return calculateProject(project, buildingResults, transport, markupRows, rates, "Module oppervlak", projLearn, gfaByBuildingId, autoAssemblageTransport ?? 0, moduleTypeKeys.size);
   }, [project, buildings, modules, buildingInputs, overrides, materialsMap, kengetalRowsBySet, kengetalLabourBySet, allKengetalSets, transport, markupRows, labourRates, csvAggregatesByBuilding, csvOverridesByBuilding, autoAssemblageTransport]);
 }

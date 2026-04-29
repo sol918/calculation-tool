@@ -383,6 +383,17 @@ export async function POST(request: Request) {
     });
   }
 
+  // Persist het project-brede totaal zodat de begroting na een reload de
+  // assemblage-transport-post direct kent — ook als deze fetch (of geocoding)
+  // bij de volgende mount tijdelijk faalt. Alleen bij project-brede calls; per-
+  // gebouw scopen we niet, anders zou een single-building-tab het project-totaal
+  // overschrijven met een gedeeltelijk getal.
+  if (!buildingIdFilter) {
+    try {
+      await db.update(projects).set({ autoAssemblageTransportCost: totalCost }).where(eq(projects.id, projectId));
+    } catch { /* niet kritiek — calc gaat door */ }
+  }
+
   return NextResponse.json({
     scope: buildingIdFilter ? "building" : "all",
     buildingName: buildingIdFilter ? (bldgs[0]?.name ?? null) : null,

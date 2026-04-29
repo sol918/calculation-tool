@@ -36,10 +36,6 @@ export async function POST(request: Request) {
   const defaults: { costGroup: any; name: string; type: any; value: number; basis: any; sort: number }[] = [
     { costGroup: "bouwpakket",    name: "Marge bouwpakket",         type: "percentage", value: 0,    basis: "group_cumulative", sort: 0 },
     { costGroup: "installateur",  name: "Marge installateur",       type: "percentage", value: 0,    basis: "group_cumulative", sort: 0 },
-    // "Correctiefactor inefficiëntie" — opslag die productieverliezen/inefficiëntie
-    // afvangt. Apart zichtbaar (niet verstopt in de DeJong-leercurve) zodat de
-    // gebruiker direct ziet waar dit getal vandaan komt.
-    { costGroup: "assemblagehal", name: "Correctiefactor inefficiëntie", type: "percentage", value: 5,    basis: "group_cumulative", sort: 0 },
     { costGroup: "assemblagehal", name: "AK Assemblagehal",         type: "percentage", value: 12.5, basis: "totaal_ex_derden", sort: 1 },
     { costGroup: "assemblagehal", name: "W&R Assemblagehal",        type: "percentage", value: 3.0,  basis: "totaal_ex_derden", sort: 2 },
     { costGroup: "derden",        name: "AK + W&R",                 type: "percentage", value: 14,   basis: "inkoop_derden",    sort: 1 },

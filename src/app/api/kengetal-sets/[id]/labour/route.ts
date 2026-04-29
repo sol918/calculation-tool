@@ -19,7 +19,8 @@ export async function PUT(request: Request, { params }: { params: { id: string }
     where: and(eq(kengetalLabour.setId, params.id), eq(kengetalLabour.inputLabel, body.inputLabel)),
   });
   const editableKeys = [
-    "costGroup", "hoursPerInput", "installatieHoursPerInput", "description",
+    "costGroup", "hoursPerInput", "installatieHoursPerInput", "arbeidBuitenHrsPerInput",
+    "projectmgmtHrsPerInput", "description",
     "gezaagdM3PerInput", "cncSimpelM3PerInput", "cncComplexM3PerInput",
   ];
   if (existing) {
@@ -36,6 +37,8 @@ export async function PUT(request: Request, { params }: { params: { id: string }
     costGroup: body.costGroup ?? "arbeid",
     hoursPerInput: body.hoursPerInput ?? 0,
     installatieHoursPerInput: body.installatieHoursPerInput ?? 0,
+    arbeidBuitenHrsPerInput: body.arbeidBuitenHrsPerInput ?? 0,
+    projectmgmtHrsPerInput: body.projectmgmtHrsPerInput ?? 0,
     gezaagdM3PerInput: body.gezaagdM3PerInput ?? 0,
     cncSimpelM3PerInput: body.cncSimpelM3PerInput ?? 0,
     cncComplexM3PerInput: body.cncComplexM3PerInput ?? 0,

@@ -50,6 +50,17 @@ export default function ProjectLayout({ children }: { children: React.ReactNode 
   const [autoAssemblageTransport, setAutoAssemblageTransport] = useState<number | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
+  // Hydrate van de DB-persisted waarde — ALTIJD syncen wanneer die wijzigt, niet
+  // alleen op eerste mount. Anders blijft een verouderde React-state hangen
+  // terwijl de DB al is bijgewerkt. De persisted waarde wordt door zowel
+  // TransportCalculator als de layout-background-fetch ververst (na POST).
+  useEffect(() => {
+    const persisted = (data.project as any)?.autoAssemblageTransportCost;
+    if (typeof persisted === "number" && persisted > 0) {
+      setAutoAssemblageTransport(persisted);
+    }
+  }, [data.project?.id, (data.project as any)?.autoAssemblageTransportCost]);
+
   // Auto-select first building once loaded
   useEffect(() => {
     if (!selectedBuildingId && data.buildings.length > 0) {
@@ -63,11 +74,45 @@ export default function ProjectLayout({ children }: { children: React.ReactNode 
   // Achtergrond-fetch van het project-brede transport naar de assemblagehal.
   // Draait zodra er een destinationAddress + minimaal één gebouw bekend is, zodat de
   // begroting direct een realistisch assemblagehal-transport laat zien — ook als de
-  // gebruiker de Transport-tab nog niet heeft geopend.
+  // gebruiker de Transport-tab nog niet heeft geopend. Re-fetcht bij elke wijziging
+  // die de transport-prijs beïnvloedt: modules (L/W/H/aantal voor bin-packing),
+  // adressen, laad-/lostijd, werkdag, retour, extra ritten.
   const buildingsSig = data.buildings.map((b) => b.id).join(",");
+  const modulesSig = useMemo(() => {
+    const parts: string[] = [];
+    for (const [bid, mods] of data.modules) {
+      const sorted = [...mods].sort((a, b) => a.id.localeCompare(b.id));
+      for (const m of sorted) parts.push(`${bid}:${m.lengthM}x${m.widthM}x${m.heightM}x${m.count}`);
+    }
+    return parts.join("|");
+  }, [data.modules]);
+  // Single signature van alles wat transport-prijs beïnvloedt — als deze string
+  // verandert, fire'en we een nieuwe project-brede berekening die persist.
+  const transportSig = useMemo(() => {
+    const p = data.project;
+    return JSON.stringify({
+      pid: projectId,
+      dest: p?.destinationAddress ?? "",
+      way:  p?.waypointAddress ?? "",
+      ret:  p?.returnToStart ? 1 : 0,
+      load: p?.loadTimeMinutes ?? 0,
+      work: p?.workdayHours ?? 0,
+      extC: p?.extraTripsCount ?? 0,
+      extA: p?.extraTripsAuto ? 1 : 0,
+      extCost: p?.extraTripCost ?? 0,
+      bldgs: buildingsSig,
+      mods: modulesSig,
+    });
+  }, [
+    projectId, data.project?.destinationAddress, data.project?.waypointAddress,
+    data.project?.returnToStart, data.project?.loadTimeMinutes, data.project?.workdayHours,
+    data.project?.extraTripsCount, data.project?.extraTripsAuto, data.project?.extraTripCost,
+    buildingsSig, modulesSig,
+  ]);
   useEffect(() => {
     if (!data.project?.destinationAddress || data.buildings.length === 0) {
-      setAutoAssemblageTransport(null);
+      // Geen reset op null als we al een persisted waarde hebben — anders zou de
+      // begroting tijdens loading de transport-post tijdelijk verliezen.
       return;
     }
     let cancelled = false;
@@ -81,11 +126,15 @@ export default function ProjectLayout({ children }: { children: React.ReactNode 
         const body = await res.json();
         if (!cancelled && typeof body.totalCost === "number") {
           setAutoAssemblageTransport(body.totalCost);
+          // Trigger een refetch van data.project zodat de DB-waarde (zojuist
+          // gepersist door /api/transport/calculate) ook in data.project landt.
+          // Hierdoor blijft hydrate-logic + state consistent na een refresh.
+          data.refetch();
         }
-      } catch { /* stil falen — blijft 0 in de begroting */ }
+      } catch { /* stil falen — persisted waarde blijft staan */ }
     })();
     return () => { cancelled = true; };
-  }, [projectId, data.project?.destinationAddress, buildingsSig]);
+  }, [transportSig]);
 
   const calcResult = useCalculation({
     project: data.project,
@@ -136,6 +185,7 @@ export default function ProjectLayout({ children }: { children: React.ReactNode 
               : undefined
           }
           materialsHref={projectId ? `/library/materials?project=${projectId}` : undefined}
+          labourHref={projectId ? `/library/labour?project=${projectId}` : undefined}
           center={
             <div className="min-w-0">
               <div className="flex items-center gap-1.5">

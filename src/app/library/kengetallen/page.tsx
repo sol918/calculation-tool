@@ -178,6 +178,8 @@ export default function KengetallenLibraryPage() {
   async function upsertLabour(inputLabel: string, updates: {
     hoursPerInput?: number;
     installatieHoursPerInput?: number;
+    arbeidBuitenHrsPerInput?: number;
+    projectmgmtHrsPerInput?: number;
     gezaagdM3PerInput?: number;
     cncSimpelM3PerInput?: number;
     cncComplexM3PerInput?: number;
@@ -374,6 +376,28 @@ export default function KengetallenLibraryPage() {
                     <span className="tabular-nums">{selectedLabour?.installatieHoursPerInput ?? 0}</span>
                   )}
                   <span className="text-[10px] text-muted-foreground">u/{selectedUnit} <span className="opacity-60">→ installateur</span></span>
+
+                  <span className="font-medium text-foreground">Arbeid buiten</span>
+                  {canEdit ? (
+                    <Input
+                      key={`lab-arbb-${selectedLabel}-${(selectedLabour as any)?.arbeidBuitenHrsPerInput ?? 0}`}
+                      className="h-7 w-20 text-right text-xs tabular-nums"
+                      inputMode="decimal"
+                      defaultValue={(selectedLabour as any)?.arbeidBuitenHrsPerInput ?? 0}
+                      onBlur={(e) => {
+                        const raw = e.target.value.replace(",", ".").trim();
+                        if (raw === "") return;
+                        const v = parseFloat(raw);
+                        const cur = (selectedLabour as any)?.arbeidBuitenHrsPerInput ?? 0;
+                        if (!isNaN(v) && v !== cur) {
+                          upsertLabour(selectedLabel, { arbeidBuitenHrsPerInput: v });
+                        }
+                      }}
+                    />
+                  ) : (
+                    <span className="tabular-nums">{(selectedLabour as any)?.arbeidBuitenHrsPerInput ?? 0}</span>
+                  )}
+                  <span className="text-[10px] text-muted-foreground">u/{selectedUnit} <span className="opacity-60">→ arbeid buiten</span></span>
                 </div>
               </div>
             )}

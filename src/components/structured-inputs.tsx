@@ -34,7 +34,7 @@ const COMPOSITE_LABELS = new Set([
   "_pct_wsw_korte", "_pct_wsw_lange",
   "_bk_klein", "_bk_midden", "_bk_groot",
   "_balkon_aantal", "_balkon_opp_per_stuk",
-  "_los_toilet", "_voordeur_in_kozijn",
+  "_los_toilet", "_voordeur_in_kozijn", "_s2p",
   // Legacy label kept so we don't re-expose it as "Overig":
   "_wsw_m1",
 ]);
@@ -47,7 +47,7 @@ const DRIVEN_LABELS = new Set([
   "WSW korte zijde", "WSW lange zijde",
   "Badkamers klein", "Badkamers midden", "Badkamers groot",
   "Los toilet", "Balkons stuks", "Balkons opp",
-  "Module Aantal BG", "Module Aantal Dak", "Module Aantal Tussenvd",
+  "Modules begane grond", "Modules dak", "Modules tussenverdieping",
   "Module breedte totaal", "Module lengte totaal", "Module hoogte totaal",
   "Gemiddelde verdiepingshoogte",
 ]);
@@ -151,6 +151,7 @@ export function StructuredInputs({ buildingId, inputs, modules, onChanged, known
   const balkonOppRaw = getQty("_balkon_opp_per_stuk");
   const balkonOppPerStuk = balkonOppRaw || DEFAULT_BALKON_OPP;
   const losToilet = getQty("_los_toilet") > 0;
+  const s2pActive = getQty("_s2p") > 0;
 
   const aantalVoordeuren = aantalWoningen;
   const voordeurRaw = inputs.find((i) => i.inputLabel === "_voordeur_in_kozijn");
@@ -482,6 +483,28 @@ export function StructuredInputs({ buildingId, inputs, modules, onChanged, known
           />
           Los toilet per appartement
         </label>
+
+        <label className="mt-1 flex items-start gap-2 text-[11px] leading-tight">
+          <input
+            type="checkbox"
+            checked={s2pActive}
+            onChange={(e) => upsertInputs({ _s2p: e.target.checked ? 1 : 0 })}
+            className="mt-0.5"
+          />
+          <span>
+            Prefab badkamer (S2P)
+            {s2pActive && (
+              <span className="ml-1 rounded bg-emerald-100 px-1 py-px text-[10px] font-medium text-emerald-800">S2P actief</span>
+            )}
+          </span>
+        </label>
+        {s2pActive && (
+          <div className="rounded bg-emerald-50 px-2 py-1 text-[11px] leading-tight text-emerald-900">
+            S2P geselecteerd — sanitair per woning, waterleiding per woning, en alle kengetallen + arbeid
+            voor badkamers (klein/midden/groot) en los toilet vervallen. In plaats daarvan worden er
+            stelposten toegevoegd: toilet €2.000, badkamer klein €7.000, midden €9.000, groot €11.000 per stuk.
+          </div>
+        )}
 
         <FieldRow label="Balkons / galerijen" unit="stuks" warning={warnings.balkonAantal} id="w-balkonAantal">
           <NumInput value={balkonAantal} onBlur={(v) => upsertInputs({ _balkon_aantal: v, "Balkons stuks": v, "Balkons opp": v * balkonOppPerStuk })} integer

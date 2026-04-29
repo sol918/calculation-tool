@@ -47,10 +47,15 @@ interface Props {
   project: Project & { extraTripsAuto?: boolean };
   scope: { mode: "all" } | { mode: "building"; buildingId: string };
   onProjectChange: () => void;
-  onTotalChange?: (total: number | null) => void;
+  /** Per-scope totaal — per-gebouw als scope=building, anders project-breed.
+   *  Voor weergave in de Transport-tab UI. */
+  onScopeTotal?: (total: number | null) => void;
+  /** Project-breed totaal — wordt ALTIJD geëmit, ook als de scope een gebouw is.
+   *  Drijft `autoAssemblageTransport` in de begroting; persisteert in DB. */
+  onProjectTotal?: (total: number | null) => void;
 }
 
-export function TransportCalculator({ project, scope, onProjectChange, onTotalChange }: Props) {
+export function TransportCalculator({ project, scope, onProjectChange, onScopeTotal, onProjectTotal }: Props) {
   const [result, setResult] = useState<Result | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -63,18 +68,37 @@ export function TransportCalculator({ project, scope, onProjectChange, onTotalCh
   const calculate = useCallback(async () => {
     setLoading(true); setError(null);
     try {
+      // Scope-specifieke berekening (per-gebouw of project-breed) → toont in de tab.
       const res = await fetch(`/api/transport/calculate`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ projectId: project.id, buildingId }),
       });
       const data = await res.json();
-      if (!res.ok) { setError(data.error ?? "Berekening mislukt"); setResult(null); onTotalChange?.(null); return; }
+      if (!res.ok) { setError(data.error ?? "Berekening mislukt"); setResult(null); onScopeTotal?.(null); return; }
       setResult(data);
-      onTotalChange?.(data.totalCost);
+      onScopeTotal?.(data.totalCost);
+
+      // Project-brede sync — schrijft persisted DB-waarde + update begroting-state.
+      // Als de scope-call al project-breed was hergebruiken we dat resultaat;
+      // anders een tweede POST zonder buildingId.
+      if (!buildingId) {
+        onProjectTotal?.(data.totalCost);
+      } else {
+        try {
+          const projRes = await fetch(`/api/transport/calculate`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ projectId: project.id }),
+          });
+          if (projRes.ok) {
+            const projBody = await projRes.json();
+            onProjectTotal?.(projBody.totalCost);
+          }
+        } catch { /* niet-kritiek — laatste bekende waarde blijft staan */ }
+      }
     } catch (e: any) {
       setError(e.message ?? "Onbekende fout");
     } finally { setLoading(false); }
-  }, [project.id, buildingId, onTotalChange]);
+  }, [project.id, buildingId, onScopeTotal, onProjectTotal]);
 
   useEffect(() => {
     if (!project.destinationAddress) { setResult(null); return; }

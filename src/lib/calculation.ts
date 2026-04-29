@@ -14,7 +14,7 @@
 import type {
   Material, KengetalRow, KengetalLabour, Building, BuildingInput, Override,
   ProjectTransport, VehicleType, Project, Module, MarkupRow, LabourRates,
-  MaterialCalcRow, BuildingCalcResult, CategoryLabourEntry, MarkupCalcRow, ProjectCalcResult,
+  MaterialCalcRow, MaterialContribution, BuildingCalcResult, CategoryLabourEntry, MarkupCalcRow, ProjectCalcResult,
   CostGroup, GroupTotals, KengetalSet,
 } from "@/types";
 import { MODULE_DERIVED_LABELS } from "@/types";
@@ -336,6 +336,54 @@ export const CSV_CODE_MAP: Record<string, string> = {
   PRO: "PROMAT",
 };
 
+/**
+ * S2P (prefab badkamer) replacement scope:
+ *   - Voor de input-labels in `S2P_REPLACED_LABELS` worden zowel kengetal-rijen
+ *     als kengetal_labour-rijen volledig overgeslagen (kosten + arbeid).
+ *   - Voor het label "Aantal appartementen" worden specifiek de SANT/WATL-rijen
+ *     overgeslagen — andere kengetallen op dat label (b.v. fundering) blijven
+ *     ongemoeid.
+ *   - In ruil daarvoor komen 4 stelpost-rijen uit `S2PT/S2PBK_S/S2PBK_M/S2PBK_L`.
+ */
+export const S2P_REPLACED_LABELS = new Set([
+  "Badkamers klein",
+  "Badkamers midden",
+  "Badkamers groot",
+  "Los toilet",
+]);
+const S2P_APPS_REPLACED_CODES = new Set(["SANT", "WATL"]);
+
+function shouldSkipForS2P(inputLabel: string, materialCode: string | undefined): boolean {
+  if (S2P_REPLACED_LABELS.has(inputLabel)) return true;
+  if (inputLabel === "Aantal appartementen" && materialCode && S2P_APPS_REPLACED_CODES.has(materialCode)) return true;
+  return false;
+}
+
+/**
+ * Planning & projectmanagement-uren. Eén formule, niet user-instelbaar — alleen het
+ * uurtarief (`projectmgmtHourlyRate`) blijft aanpasbaar via de Arbeid-pagina.
+ *
+ *   uren = 200 × n^0,434                       (basis-fit door 1→200u en 1000→4000u)
+ *        + 50 × max(0, distinctTypes − 1)      (penalty per extra moduletype na de eerste)
+ *
+ * Anchor-punten (basis-deel):
+ *   1 module     → 200 u
+ *   10 modules   → ~543 u   (Sol: ~400)
+ *   100 modules  → ~1.480 u (Sol: ~800)
+ *   1000 modules → 4.000 u
+ * Mid-range overschat licht; Sol gaf "niet heel precies" als richtlijn en koos
+ * een gladde één-term formule die de eindpunten exact raakt.
+ */
+export function computeProjectMgmtHours(totalModules: number, distinctModuleTypes: number): {
+  baseHours: number; typePenaltyHours: number; totalHours: number; exponent: number;
+} {
+  const exponent = 0.434;
+  if (totalModules <= 0) return { baseHours: 0, typePenaltyHours: 0, totalHours: 0, exponent };
+  const baseHours = 200 * Math.pow(totalModules, exponent);
+  const typePenaltyHours = Math.max(0, distinctModuleTypes - 1) * 50;
+  return { baseHours, typePenaltyHours, totalHours: baseHours + typePenaltyHours, exponent };
+}
+
 /** Default tarieven als de DB-rij ontbreekt. Spiegel van seed-defaults. */
 export const DEFAULT_LABOUR_RATES: Omit<LabourRates, "id" | "orgId"> = {
   gezaagdPerM3: 100,
@@ -469,17 +517,80 @@ export function calculateBuilding(
   for (const inp of inputs) effectiveInputs[inp.inputLabel] = inp.quantity;
   for (const [label, qty] of Object.entries(derivedInputs)) effectiveInputs[label] = qty;
 
+  // Gevel-derivatie — wanneer composite `_gevel_m1` aanwezig is, herberekenen we
+  // "Dichte gevel" / "Open gevel" hier zodat ze altijd consistent zijn met
+  // _gevel_m1, _pct_glas, modules en Dakomtrek (de UI doet dit live in
+  // structured-inputs.tsx). Dit voorkomt stale canonical values als modules of
+  // de dakomtrek wijzigen zonder dat de gevelvelden opnieuw worden bewerkt.
+  // "Aantal kozijnen" wordt alleen overschreven als de composite expliciet bestaat.
+  if (effectiveInputs["_gevel_m1"] != null) {
+    const DAKRAND_HOOGTE_M = 0.5;
+    const KOZIJN_OPP_PER_STUK = 1.8;
+    const DEFAULT_VERDIEPINGSHOOGTE = 3.155;
+    const gevelM1 = effectiveInputs["_gevel_m1"] ?? 0;
+    const pctGlas = effectiveInputs["_pct_glas"] ?? 0;
+    let totalCount = 0;
+    let weightedHoogte = 0;
+    for (const m of mods) {
+      totalCount += m.count;
+      weightedHoogte += m.heightM * m.count;
+    }
+    const avgHoogte = totalCount > 0 ? weightedHoogte / totalCount : DEFAULT_VERDIEPINGSHOOGTE;
+    const dakomtrek = effectiveInputs["Dakomtrek"] ?? 0;
+    const voordeurInKozijn = effectiveInputs["_voordeur_in_kozijn"] != null
+      ? effectiveInputs["_voordeur_in_kozijn"] > 0
+      : true;
+    const aantalVoordeuren = effectiveInputs["Aantal appartementen"] ?? 0;
+    const voordeurExtraOpp = voordeurInKozijn ? 0 : aantalVoordeuren * KOZIJN_OPP_PER_STUK;
+    const gevelOpp = gevelM1 * avgHoogte + dakomtrek * DAKRAND_HOOGTE_M;
+    const openGevel = gevelOpp * (pctGlas / 100) + voordeurExtraOpp;
+    const dichteGevel = Math.max(0, gevelOpp - openGevel);
+    effectiveInputs["Dichte gevel"] = dichteGevel;
+    effectiveInputs["Open gevel"] = openGevel;
+    if (effectiveInputs["_aantal_kozijnen"] != null) {
+      effectiveInputs["Aantal kozijnen"] = effectiveInputs["_aantal_kozijnen"];
+    }
+  }
+
+  // WSW-derivatie (.optop) — composite `_wsw_korte_m1`/`_wsw_lange_m1` zijn de
+  // bron van waarheid voor de canonical labels "WSW korte zijde"/"WSW lange
+  // zijde". Voorkomt stale canonical-data uit oudere UI-versies waar alleen de
+  // composite werd weggeschreven (waardoor WSW-arbeid en kengetal-materialen
+  // niet meer mee werden gerekend).
+  if (effectiveInputs["_wsw_korte_m1"] != null) {
+    effectiveInputs["WSW korte zijde"] = effectiveInputs["_wsw_korte_m1"];
+  }
+  if (effectiveInputs["_wsw_lange_m1"] != null) {
+    effectiveInputs["WSW lange zijde"] = effectiveInputs["_wsw_lange_m1"];
+  }
+
+  // S2P (prefab badkamer) — als het vinkje op het gebouw aan staat vervangt het
+  // de kengetal-bijdragen voor sanitair/waterleiding (op "Aantal appartementen")
+  // en de badkamers/los toilet (kengetallen + arbeid). Stelposten worden onderaan
+  // synthetisch toegevoegd.
+  const s2pActive = (inputs.find((i) => i.inputLabel === "_s2p")?.quantity ?? 0) > 0;
+
   // Apply kengetallen → per-material netto quantities. Arbeid komt NIET meer uit de
   // material-row of de kengetal-row, maar uit aparte `kengetal_labour` rijen
-  // (één getal per invoercategorie).
-  const materialQuantities = new Map<string, { netto: number }>();
+  // (één getal per invoercategorie). We bewaren ook de per-invoer-bijdrage zodat
+  // de begroting-UI een materiaal kan uitklappen tot zijn herkomst.
+  const materialQuantities = new Map<string, { netto: number; contributions: MaterialContribution[] }>();
   for (const [label, qty] of Object.entries(effectiveInputs)) {
     const matching = kengetallen.filter((k) => k.inputLabel === label);
     for (const kg of matching) {
+      if (s2pActive && shouldSkipForS2P(label, materialsMap.get(kg.materialId)?.code)) continue;
       const netto = qty * kg.ratio;
+      if (netto === 0) continue;
       const existing = materialQuantities.get(kg.materialId);
-      if (existing) existing.netto += netto;
-      else materialQuantities.set(kg.materialId, { netto });
+      if (existing) {
+        existing.netto += netto;
+        existing.contributions.push({ inputLabel: label, ratio: kg.ratio, inputQty: qty, netto });
+      } else {
+        materialQuantities.set(kg.materialId, {
+          netto,
+          contributions: [{ inputLabel: label, ratio: kg.ratio, inputQty: qty, netto }],
+        });
+      }
     }
   }
 
@@ -500,9 +611,14 @@ export function calculateBuilding(
       const qty = effectiveInputs[label] ?? 0;
       if (qty <= 0 || ratio <= 0) continue;
       const addedM3 = qty * ratio;
+      const contrib: MaterialContribution = { inputLabel: label, ratio, inputQty: qty, netto: addedM3 };
       const existing = materialQuantities.get(kramMaterial.id);
-      if (existing) existing.netto += addedM3;
-      else materialQuantities.set(kramMaterial.id, { netto: addedM3 });
+      if (existing) {
+        existing.netto += addedM3;
+        existing.contributions.push(contrib);
+      } else {
+        materialQuantities.set(kramMaterial.id, { netto: addedM3, contributions: [contrib] });
+      }
     }
   }
 
@@ -526,12 +642,12 @@ export function calculateBuilding(
       const agg = aggByKey.get(`${o.csvCode}|${o.csvUnit}`);
       if (!mat || !agg) continue;
       const qty = csvQtyForMaterial(agg, mat.unit);
-      if (qty > 0) materialQuantities.set(o.materialId, { netto: qty });
+      if (qty > 0) materialQuantities.set(o.materialId, { netto: qty, contributions: [{ inputLabel: "CSV-import", ratio: 1, inputQty: qty, netto: qty }] });
     }
   }
 
   const rows: MaterialCalcRow[] = [];
-  for (const [materialId, { netto }] of materialQuantities) {
+  for (const [materialId, { netto, contributions }] of materialQuantities) {
     const material = materialsMap.get(materialId);
     if (!material) continue;
 
@@ -576,6 +692,7 @@ export function calculateBuilding(
       materialCost, laborHours: laborHrs,
       laborHoursBron: "default",
       laborCost,
+      contributions: (contributions ?? []).map((c) => ({ ...c, buildingName: building.name })),
     });
   }
 
@@ -630,6 +747,7 @@ export function calculateBuilding(
   //   - Gezaagd / CNC (m³)        → bouwpakket-groep,  € = m³ × €/m³-tarief
   const labourEntries: CategoryLabourEntry[] = [];
   for (const lr of labourRows) {
+    if (s2pActive && S2P_REPLACED_LABELS.has(lr.inputLabel)) continue;
     const qty = effectiveInputs[lr.inputLabel] ?? 0;
     if (qty <= 0) continue;
 
@@ -655,6 +773,18 @@ export function calculateBuilding(
         inputQty: qty,
         totalHours: hours,
         cost: hours * rates.installatieHourlyRate,
+      });
+    }
+    const arbeidBuitenHourly = (lr as any).arbeidBuitenHrsPerInput ?? 0;
+    if (arbeidBuitenHourly > 0) {
+      const hours = qty * arbeidBuitenHourly * learnFactor;
+      labourEntries.push({
+        inputLabel: `${lr.inputLabel} — arbeid buiten`,
+        costGroup: "assemblagehal",
+        hoursPerInput: arbeidBuitenHourly,
+        inputQty: qty,
+        totalHours: hours,
+        cost: hours * rates.arbeidBuitenHourlyRate,
       });
     }
 
@@ -703,6 +833,44 @@ export function calculateBuilding(
     });
   }
 
+  // S2P stelposten — telt prefab-badkamer-units mee als de S2P-vlag aan staat.
+  // De materialen (S2PT/S2PBK_S/S2PBK_M/S2PBK_L) komen uit de seed; prijzen zijn
+  // per-organisatie aanpasbaar via de materialenbibliotheek. Per-project
+  // overrides (buildingOverrides) worden gerespecteerd voor netto/loss/prijs.
+  if (s2pActive) {
+    const s2pUnits: { code: string; qty: number }[] = [
+      { code: "S2PT",    qty: effectiveInputs["Los toilet"]       ?? 0 },
+      { code: "S2PBK_S", qty: effectiveInputs["Badkamers klein"]  ?? 0 },
+      { code: "S2PBK_M", qty: effectiveInputs["Badkamers midden"] ?? 0 },
+      { code: "S2PBK_L", qty: effectiveInputs["Badkamers groot"]  ?? 0 },
+    ];
+    const matsByCode = new Map<string, Material>();
+    for (const m of materialsMap.values()) matsByCode.set(m.code, m);
+    for (const { code, qty } of s2pUnits) {
+      const mat = matsByCode.get(code);
+      if (!mat || qty <= 0) continue;
+      const override = buildingOverrides.find((o) => o.materialId === mat.id);
+      const effectiveNetto = override?.quantity ?? qty;
+      const effectiveLoss = override?.lossPct ?? mat.lossPct;
+      const effectivePrice = override?.pricePerUnit ?? mat.pricePerUnit;
+      const bruto = effectiveNetto * (1 + effectiveLoss);
+      rows.push({
+        material: mat,
+        netto: effectiveNetto,
+        nettoBron: override?.quantity != null ? override.source : "kengetal",
+        loss: effectiveLoss,
+        lossBron: override?.lossPct != null ? override.source : "default",
+        bruto,
+        price: effectivePrice,
+        priceBron: override?.pricePerUnit != null ? override.source : "default",
+        materialCost: bruto * effectivePrice,
+        laborHours: 0,
+        laborHoursBron: "default",
+        laborCost: 0,
+      });
+    }
+  }
+
   rows.sort((a, b) => {
     const order: Record<CostGroup, number> = { bouwpakket: 0, installateur: 1, assemblagehal: 2, arbeid: 3, derden: 4, hoofdaannemer: 5 };
     const ga = order[a.material.costGroup];
@@ -739,6 +907,9 @@ function mergeAllRows(buildingResults: BuildingCalcResult[]): MaterialCalcRow[] 
       const key = row.material.id;
       const count = br.building.count;
       const existing = merged.get(key);
+      const scaledContribs: MaterialContribution[] = (row.contributions ?? []).map((c) => ({
+        ...c, inputQty: c.inputQty * count, netto: c.netto * count,
+      }));
       if (existing) {
         merged.set(key, {
           ...existing,
@@ -747,6 +918,7 @@ function mergeAllRows(buildingResults: BuildingCalcResult[]): MaterialCalcRow[] 
           materialCost: existing.materialCost + row.materialCost * count,
           laborHours: existing.laborHours + row.laborHours * count,
           laborCost: existing.laborCost + row.laborCost * count,
+          contributions: [...(existing.contributions ?? []), ...scaledContribs],
         });
       } else {
         merged.set(key, {
@@ -756,6 +928,7 @@ function mergeAllRows(buildingResults: BuildingCalcResult[]): MaterialCalcRow[] 
           materialCost: row.materialCost * count,
           laborHours: row.laborHours * count,
           laborCost: row.laborCost * count,
+          contributions: scaledContribs,
         });
       }
     }
@@ -953,6 +1126,9 @@ export function calculateProject(
    *  Komt boven op assemblagehal.transportCost zodat de gebruiker niet vergeet
    *  dat deze post in de begroting hoort. */
   autoAssemblageTransport: number = 0,
+  /** Aantal unieke moduletypes (L|W|H tuples) over het hele project. Drijft de
+   *  type-penalty in computeProjectMgmtHours (50u per extra type na de eerste). */
+  distinctModuleTypes: number = 1,
 ): ProjectCalcResult {
   const allRows = mergeAllRows(buildingResults);
 
@@ -995,16 +1171,32 @@ export function calculateProject(
     const cntPerBuilding = br.effectiveInputs[MODULE_DERIVED_LABELS.COUNT] ?? 0;
     totalModules += cntPerBuilding * br.building.count;
   }
-  // Arbeid-buiten en projectmanagement = basis-uren + uren per module, gewogen met
-  // de projectbrede leerfactor. Basis-uren worden NIET geschaald met de leercurve
-  // (zijn setup/overhead die niet repeteert), per-module-uren WEL.
-  const arbeidBuitenHours = rates.arbeidBuitenHoursBase
-    + totalModules * rates.arbeidBuitenHoursPerModule * projectLearningFactor;
-  const projectmgmtHours = rates.projectmgmtHoursBase
-    + totalModules * rates.projectmgmtHoursPerModule * projectLearningFactor;
-  const arbeidBuitenCost = arbeidBuitenHours * rates.arbeidBuitenHourlyRate;
-  const projectmgmtCost  = projectmgmtHours  * rates.projectmgmtHourlyRate;
-  assemblagehal.laborCost += arbeidBuitenCost + projectmgmtCost;
+  // Arbeid-buiten op project-niveau is verwijderd — wordt nu volledig via per-kengetal
+  // `arbeidBuitenHrsPerInput` afgehandeld. De labour_rates.arbeidBuitenHoursBase /
+  // -PerModule velden blijven bestaan in DB maar worden niet meer in de calc gebruikt.
+  const arbeidBuitenHours = 0;
+  const arbeidBuitenCost = 0;
+  // Projectmanagement = vaste formule (200 × n^0,434 + 50 × extra moduletypes),
+  // niet meer afhankelijk van labour_rates.projectmgmtHoursBase / -PerModule.
+  // Alleen het uurtarief blijft instelbaar.
+  const pm = computeProjectMgmtHours(totalModules, distinctModuleTypes);
+  const projectmgmtCost = pm.totalHours * rates.projectmgmtHourlyRate;
+  assemblagehal.laborCost += projectmgmtCost;
+
+  // Project-niveau labour entries — PM is projectbrede overhead. Door 'm als
+  // CategoryLabourEntry te exposen verschijnt ie in de begroting onder
+  // Assemblagehal → Arbeid (en kan ie ook uit/aan worden gevinkt).
+  const projectLevelLabour: CategoryLabourEntry[] = [];
+  if (projectmgmtCost > 0) {
+    projectLevelLabour.push({
+      inputLabel: "Projectmanagement",
+      costGroup: "assemblagehal",
+      hoursPerInput: 0,
+      inputQty: totalModules,
+      totalHours: pm.totalHours,
+      cost: projectmgmtCost,
+    });
+  }
 
   // Handmatige transportregels uit projectTransport.
   for (const t of transport) {
@@ -1156,6 +1348,13 @@ export function calculateProject(
     bouwpakket, installateur, assemblagehal, arbeid, derden, hoofdaannemer,
     autoTransport: auto,
     arbeidBuitenCost, projectmgmtCost, totalModules,
+    projectmgmtHours: pm.totalHours,
+    projectmgmtBaseHours: pm.baseHours,
+    projectmgmtTypePenaltyHours: pm.typePenaltyHours,
+    projectmgmtExponent: pm.exponent,
+    distinctModuleTypes,
+    arbeidBuitenHours,
+    projectLevelLabour,
     totaalExDerden, preProjectMarkups,
     projectMarkups, totalProjectMarkups,
     totalDirect, totalMaterial, totalLabor, totalTransport,
