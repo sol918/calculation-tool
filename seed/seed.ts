@@ -208,6 +208,16 @@ async function seed() {
       uploaded_at TEXT,
       file_name TEXT
     );
+    CREATE TABLE IF NOT EXISTS project_extra_lines (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      cost_group TEXT NOT NULL DEFAULT 'assemblagehal' CHECK(cost_group IN ('bouwpakket','installateur','assemblagehal','derden')),
+      description TEXT NOT NULL DEFAULT '',
+      quantity REAL NOT NULL DEFAULT 1,
+      unit TEXT NOT NULL DEFAULT 'stuks',
+      price_per_unit REAL NOT NULL DEFAULT 0,
+      sort_order INTEGER NOT NULL DEFAULT 0
+    );
     CREATE TABLE IF NOT EXISTS csv_material_overrides (
       building_id TEXT NOT NULL REFERENCES buildings(id) ON DELETE CASCADE,
       material_id TEXT NOT NULL REFERENCES materials(id) ON DELETE CASCADE,
@@ -289,10 +299,13 @@ async function seed() {
     { from: "Lengte totaal",            to: "Module lengte totaal" },
     { from: "Breedte totaal",           to: "Module breedte totaal" },
     { from: "Hoogte totaal",            to: "Module hoogte totaal" },
-    // Module-aantal labels: lees-vriendelijk, geen afkortingen meer.
-    { from: "Module Aantal BG",          to: "Modules begane grond" },
-    { from: "Module Aantal Dak",         to: "Modules dak" },
-    { from: "Module Aantal Tussenvd",    to: "Modules tussenverdieping" },
+    // Module-aantal labels: compacter "Module Aant {suffix}" — sluit aan bij Module Opp.
+    { from: "Module Aantal BG",          to: "Module Aant BG" },
+    { from: "Module Aantal Dak",         to: "Module Aant Dak" },
+    { from: "Module Aantal Tussenvd",    to: "Module Aant Tussenvd" },
+    { from: "Modules begane grond",      to: "Module Aant BG" },
+    { from: "Modules dak",               to: "Module Aant Dak" },
+    { from: "Modules tussenverdieping",  to: "Module Aant Tussenvd" },
   ];
   for (const { from, to } of labelRenames) {
     try { await client.execute({ sql: "UPDATE kengetal_rows SET input_label = ? WHERE input_label = ?", args: [to, from] }); } catch {}

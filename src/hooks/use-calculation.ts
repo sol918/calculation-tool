@@ -8,7 +8,7 @@ import {
 import type {
   Project, Building, BuildingInput, Override, Material, Module,
   KengetalRow, KengetalLabour, KengetalSet, ProjectTransport, VehicleType, MarkupRow,
-  LabourRates, ProjectCalcResult,
+  LabourRates, ProjectCalcResult, ProjectExtraLine,
 } from "@/types";
 import type { CsvAggregate, CsvOverrideEntry } from "@/lib/calculation";
 
@@ -29,12 +29,13 @@ interface UseCalculationInput {
   csvOverridesByBuilding?: Map<string, CsvOverrideEntry[]>;
   /** Extern berekend transport dat boven op assemblagehal.transportCost komt (Transport 3D modulair). */
   autoAssemblageTransport?: number | null;
+  extraLines?: ProjectExtraLine[];
 }
 
 export function useCalculation({
   project, buildings, modules, buildingInputs, overrides, materialsMap,
   kengetalRowsBySet, kengetalLabourBySet, allKengetalSets, transport, markupRows, labourRates,
-  csvAggregatesByBuilding, csvOverridesByBuilding, autoAssemblageTransport,
+  csvAggregatesByBuilding, csvOverridesByBuilding, autoAssemblageTransport, extraLines,
 }: UseCalculationInput): ProjectCalcResult | null {
   return useMemo(() => {
     if (!project) return null;
@@ -97,6 +98,6 @@ export function useCalculation({
       const mods = modules.get(b.id) ?? [];
       for (const m of mods) moduleTypeKeys.add(`${m.lengthM}|${m.widthM}|${m.heightM}`);
     }
-    return calculateProject(project, buildingResults, transport, markupRows, rates, "Module oppervlak", projLearn, gfaByBuildingId, autoAssemblageTransport ?? 0, moduleTypeKeys.size);
-  }, [project, buildings, modules, buildingInputs, overrides, materialsMap, kengetalRowsBySet, kengetalLabourBySet, allKengetalSets, transport, markupRows, labourRates, csvAggregatesByBuilding, csvOverridesByBuilding, autoAssemblageTransport]);
+    return calculateProject(project, buildingResults, transport, markupRows, rates, "Module oppervlak", projLearn, gfaByBuildingId, autoAssemblageTransport ?? 0, moduleTypeKeys.size, extraLines ?? []);
+  }, [project, buildings, modules, buildingInputs, overrides, materialsMap, kengetalRowsBySet, kengetalLabourBySet, allKengetalSets, transport, markupRows, labourRates, csvAggregatesByBuilding, csvOverridesByBuilding, autoAssemblageTransport, extraLines]);
 }

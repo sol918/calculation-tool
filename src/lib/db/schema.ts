@@ -230,6 +230,21 @@ export const vehicleTypes = sqliteTable("vehicle_types", {
   maxWeightKg: real("max_weight_kg"),
 });
 
+// ── Project Extra Lines ──
+// Handmatige post per project — tellen op bij assemblagehal.materialCost (direct
+// cost). Per project bewerkbaar via de begroting (aparte "Handmatige posten"
+// sectie) zonder dat de kengetal-bibliotheek of materialen aangepast hoeven worden.
+export const projectExtraLines = sqliteTable("project_extra_lines", {
+  id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+  projectId: text("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),
+  costGroup: text("cost_group", { enum: ["bouwpakket", "installateur", "assemblagehal", "derden"] }).notNull().default("assemblagehal"),
+  description: text("description").notNull().default(""),
+  quantity: real("quantity").notNull().default(1),
+  unit: text("unit").notNull().default("stuks"),
+  pricePerUnit: real("price_per_unit").notNull().default(0),
+  sortOrder: integer("sort_order").notNull().default(0),
+});
+
 // ── Project Transport ──
 export const projectTransport = sqliteTable("project_transport", {
   id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),

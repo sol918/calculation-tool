@@ -252,9 +252,9 @@ export function BegrotingView({ scope, density = "normal" }: Props) {
       return out;
     }
 
-    /** Vouw "Modules begane grond/dak/tussenverdieping [— suffix]" samen tot "Modules [— suffix]". */
+    /** Vouw "Module Aant BG/Dak/Tussenvd [— suffix]" samen tot "Module Aant [— suffix]". */
     const collapseLabel = (label: string) =>
-      label.replace(/^Modules (begane grond|dak|tussenverdieping)(\s—|$)/, "Modules$2");
+      label.replace(/^Module Aant (BG|Dak|Tussenvd)(\s—|$)/, "Module Aant$2");
 
     const merged = new Map<string, CategoryLabourEntry>();
     for (const br of sources) {
@@ -356,6 +356,13 @@ export function BegrotingView({ scope, density = "normal" }: Props) {
       for (const e of labEntries) if (!isDisabled(`lab:${g.group}:${e.inputLabel}`)) total += e.cost;
     }
     if (!isDisabled(`tr:${g.group}`)) total += g.transportCost;
+    // Handmatige posten (per-project) — tellen op bij de directe kosten van deze
+    // groep, behalve wanneer individueel uitgevinkt via xl:{id}.
+    for (const x of (data.extraLines ?? [])) {
+      if (x.costGroup !== g.group) continue;
+      if (isDisabled(`xl:${x.id}`)) continue;
+      total += (x.quantity ?? 0) * (x.pricePerUnit ?? 0);
+    }
     return total;
   }
 
@@ -749,6 +756,11 @@ export function BegrotingView({ scope, density = "normal" }: Props) {
         for (const e of labEntries) if (!isDisabled(`lab:${g.group}:${e.inputLabel}`)) total += e.cost;
       }
       total += g.transportCost;
+      for (const x of (data.extraLines ?? [])) {
+        if (x.costGroup !== g.group) continue;
+        if (isDisabled(`xl:${x.id}`)) continue;
+        total += (x.quantity ?? 0) * (x.pricePerUnit ?? 0);
+      }
       for (const m of g.markups) if (isMarkupEnabled(g.group, m.id)) total += effectiveMarkupAmount(m);
       return total;
     })();
@@ -1042,6 +1054,10 @@ export function BegrotingView({ scope, density = "normal" }: Props) {
               );
             })()}
 
+            {/* Handmatige posten — per-project, optellen bij groep.materialCost.
+                 Bewerkbaar (description / qty / unit / price) + add/delete. */}
+            {isAll && renderExtraLinesForGroup(g.group)}
+
             {/* Footer: gecombineerd breakdown + inline-bewerkbare markups + subtotaal. */}
             {renderGroupFooter(g, label)}
           </div>
@@ -1110,6 +1126,135 @@ export function BegrotingView({ scope, density = "normal" }: Props) {
         </span>
         <span className={`w-24 text-right tabular-nums ${mkOff ? "line-through opacity-60" : ""}`}>{formatEUR(effAmount)}</span>
       </React.Fragment>
+    );
+  }
+
+  // ── Handmatige posten (per-project) ─────────────────────────────
+  async function addExtraLine(group: CostGroup) {
+    if (!data.project) return;
+    await fetch(`/api/projects/${data.project.id}/extra-lines`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ costGroup: group, description: "Nieuwe post", quantity: 1, unit: "stuks", pricePerUnit: 0 }),
+    });
+    data.refetch();
+  }
+  async function patchExtraLine(id: string, updates: Record<string, any>) {
+    if (!data.project) return;
+    await fetch(`/api/projects/${data.project.id}/extra-lines`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, ...updates }),
+    });
+    data.refetch();
+  }
+  async function deleteExtraLine(id: string) {
+    if (!data.project) return;
+    await fetch(`/api/projects/${data.project.id}/extra-lines?id=${id}`, { method: "DELETE" });
+    data.refetch();
+  }
+
+  function renderExtraLinesForGroup(group: CostGroup) {
+    const lines = (data.extraLines ?? []).filter((x) => x.costGroup === group);
+    if (lines.length === 0 && group !== "assemblagehal") {
+      // Toon de "+ Handmatige post"-knop alleen voor de groepen waarvoor het zin
+      // heeft (assemblagehal is de hoofd-use-case van Sol).
+      return null;
+    }
+    const accent = THEME_COLORS[group];
+    const accentStyle: React.CSSProperties | undefined = accent ? { accentColor: accent } : undefined;
+    return (
+      <div className="border-t bg-amber-50/30 px-3 py-2 text-xs">
+        <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-muted-foreground">
+          <span>Handmatige posten</span>
+          <Button variant="ghost" size="sm" className="h-6 text-[11px] text-muted-foreground"
+            onClick={() => addExtraLine(group)}>
+            <Plus className="mr-1 h-3 w-3" /> Nieuwe post
+          </Button>
+        </div>
+        {lines.length > 0 && (
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                <th className="px-1 py-1 text-left font-medium">Omschrijving</th>
+                <th className="px-1 py-1 text-right font-medium">Aantal</th>
+                <th className="px-1 py-1 text-left font-medium">Eh.</th>
+                <th className="px-1 py-1 text-right font-medium">Prijs</th>
+                <th className="px-1 py-1 text-right font-medium">Bedrag</th>
+                <th className="w-8" />
+              </tr>
+            </thead>
+            <tbody>
+              {lines.map((x) => {
+                const xKey = `xl:${x.id}`;
+                const off = isDisabled(xKey);
+                const bedrag = (x.quantity ?? 0) * (x.pricePerUnit ?? 0);
+                return (
+                  <tr key={x.id} className={off ? "opacity-50" : ""}>
+                    <td className="px-1 py-0.5">
+                      <div className="flex items-center gap-1.5">
+                        <input
+                          type="checkbox"
+                          checked={!off}
+                          onChange={(e) => setKeyDisabled(xKey, !e.target.checked)}
+                          className="cursor-pointer"
+                          style={accentStyle}
+                          title={off ? "Weer meerekenen" : "Uitschakelen"}
+                        />
+                        <Input
+                          key={`xl-d-${x.id}-${x.description}`}
+                          className="h-7 w-full text-xs"
+                          defaultValue={x.description}
+                          onBlur={(e) => { if (e.target.value !== x.description) patchExtraLine(x.id, { description: e.target.value }); }}
+                        />
+                      </div>
+                    </td>
+                    <td className="px-1 py-0.5">
+                      <Input
+                        key={`xl-q-${x.id}-${x.quantity}`}
+                        className="h-7 w-20 text-right text-xs tabular-nums"
+                        inputMode="decimal"
+                        defaultValue={x.quantity}
+                        onBlur={(e) => {
+                          const v = parseFloat(e.target.value.replace(",", ".").trim());
+                          if (Number.isFinite(v) && v !== x.quantity) patchExtraLine(x.id, { quantity: v });
+                        }}
+                      />
+                    </td>
+                    <td className="px-1 py-0.5">
+                      <Input
+                        key={`xl-u-${x.id}-${x.unit}`}
+                        className="h-7 w-16 text-xs"
+                        defaultValue={x.unit}
+                        onBlur={(e) => { if (e.target.value !== x.unit) patchExtraLine(x.id, { unit: e.target.value }); }}
+                      />
+                    </td>
+                    <td className="px-1 py-0.5">
+                      <Input
+                        key={`xl-p-${x.id}-${x.pricePerUnit}`}
+                        className="h-7 w-24 text-right text-xs tabular-nums"
+                        inputMode="decimal"
+                        defaultValue={x.pricePerUnit}
+                        onBlur={(e) => {
+                          const v = parseFloat(e.target.value.replace(",", ".").trim());
+                          if (Number.isFinite(v) && v !== x.pricePerUnit) patchExtraLine(x.id, { pricePerUnit: v });
+                        }}
+                      />
+                    </td>
+                    <td className={`px-1 py-0.5 text-right tabular-nums font-medium ${off ? "line-through opacity-60" : ""}`}>
+                      {formatEUR(bedrag)}
+                    </td>
+                    <td className="px-1 py-0.5">
+                      <Button variant="ghost" size="icon" className="h-6 w-6 text-destructive"
+                        onClick={() => deleteExtraLine(x.id)}>
+                        <Trash2 className="h-3 w-3" />
+                      </Button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
     );
   }
 

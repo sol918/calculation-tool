@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback } from "react";
 import type {
   Project, Building, BuildingInput, Override, Material,
   KengetalSet, KengetalRow, KengetalLabour, ProjectTransport, VehicleType, Module, MarkupRow,
-  LabourRates,
+  LabourRates, ProjectExtraLine,
 } from "@/types";
 import type { CsvAggregate, CsvOverrideEntry } from "@/lib/calculation";
 
@@ -22,6 +22,7 @@ interface ProjectData {
   transport: (ProjectTransport & { vehicleType?: VehicleType })[];
   vehicleTypes: VehicleType[];
   markupRows: MarkupRow[];
+  extraLines: ProjectExtraLine[];
   labourRates: LabourRates | null;
   csvAggregatesByBuilding: Map<string, CsvAggregate[]>;
   csvOverridesByBuilding: Map<string, CsvOverrideEntry[]>;
@@ -33,7 +34,7 @@ export function useProjectData(projectId: string): ProjectData & { refetch: () =
     project: null, buildings: [], modules: new Map(), buildingInputs: new Map(),
     overrides: new Map(), materials: [], materialsMap: new Map(),
     allKengetalSets: [], kengetalRowsBySet: new Map(), kengetalLabourBySet: new Map(),
-    transport: [], vehicleTypes: [], markupRows: [], labourRates: null,
+    transport: [], vehicleTypes: [], markupRows: [], extraLines: [], labourRates: null,
     csvAggregatesByBuilding: new Map(), csvOverridesByBuilding: new Map(),
     loading: true,
   });
@@ -101,11 +102,14 @@ export function useProjectData(projectId: string): ProjectData & { refetch: () =
       const mkRes = await fetch(`/api/projects/${projectId}/markups`);
       const markupRows: MarkupRow[] = await mkRes.json();
 
+      const xlRes = await fetch(`/api/projects/${projectId}/extra-lines`);
+      const extraLines: ProjectExtraLine[] = xlRes.ok ? await xlRes.json() : [];
+
       setData({
         project, buildings, modules: modulesMap, buildingInputs,
         overrides: overridesMap, materials, materialsMap,
         allKengetalSets, kengetalRowsBySet, kengetalLabourBySet,
-        transport, vehicleTypes, markupRows, labourRates,
+        transport, vehicleTypes, markupRows, extraLines, labourRates,
         csvAggregatesByBuilding, csvOverridesByBuilding, loading: false,
       });
     } catch (err) {

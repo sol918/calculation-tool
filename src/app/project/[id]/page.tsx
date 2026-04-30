@@ -291,13 +291,13 @@ export default function ProjectPage() {
                     <span className="text-on-surface-var">Module oppervlak</span>
                     <span className="pr-3 text-right tabular-nums">{formatQty(derived[MODULE_DERIVED_LABELS.AREA] ?? 0)}</span>
                     <span className="text-on-surface-var">m²</span>
-                    <span className="text-on-surface-var">Modules begane grond</span>
+                    <span className="text-on-surface-var">Module Aant BG</span>
                     <span className="pr-3 text-right tabular-nums">{formatQty(derived[MODULE_DERIVED_LABELS.COUNT_BG] ?? 0)}</span>
                     <span className="text-on-surface-var"></span>
-                    <span className="text-on-surface-var">Modules dak</span>
+                    <span className="text-on-surface-var">Module Aant Dak</span>
                     <span className="pr-3 text-right tabular-nums">{formatQty(derived[MODULE_DERIVED_LABELS.COUNT_DAK] ?? 0)}</span>
                     <span className="text-on-surface-var"></span>
-                    <span className="text-on-surface-var">Modules tussenverdieping</span>
+                    <span className="text-on-surface-var">Module Aant Tussenvd</span>
                     <span className="pr-3 text-right tabular-nums">{formatQty(derived[MODULE_DERIVED_LABELS.COUNT_TUSSEN] ?? 0)}</span>
                     <span className="text-on-surface-var"></span>
                     <span className="text-on-surface-var">Module lengte totaal</span>

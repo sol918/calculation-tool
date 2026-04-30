@@ -152,6 +152,7 @@ export default function ProjectLayout({ children }: { children: React.ReactNode 
     csvAggregatesByBuilding: data.csvAggregatesByBuilding,
     csvOverridesByBuilding: data.csvOverridesByBuilding,
     autoAssemblageTransport,
+    extraLines: data.extraLines,
   });
 
   // Active system = selected building's system (fall back to any system in the project)

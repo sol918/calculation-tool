@@ -34,7 +34,7 @@ const COMPOSITE_LABELS = new Set([
   "_pct_wsw_korte", "_pct_wsw_lange",
   "_bk_klein", "_bk_midden", "_bk_groot",
   "_balkon_aantal", "_balkon_opp_per_stuk",
-  "_los_toilet", "_voordeur_in_kozijn", "_s2p",
+  "_los_toilet", "_voordeur_in_kozijn", "_s2p", "_afbouwniveau",
   // Legacy label kept so we don't re-expose it as "Overig":
   "_wsw_m1",
 ]);
@@ -47,7 +47,7 @@ const DRIVEN_LABELS = new Set([
   "WSW korte zijde", "WSW lange zijde",
   "Badkamers klein", "Badkamers midden", "Badkamers groot",
   "Los toilet", "Balkons stuks", "Balkons opp",
-  "Modules begane grond", "Modules dak", "Modules tussenverdieping",
+  "Module Aant BG", "Module Aant Dak", "Module Aant Tussenvd",
   "Module breedte totaal", "Module lengte totaal", "Module hoogte totaal",
   "Gemiddelde verdiepingshoogte",
 ]);
@@ -152,6 +152,7 @@ export function StructuredInputs({ buildingId, inputs, modules, onChanged, known
   const balkonOppPerStuk = balkonOppRaw || DEFAULT_BALKON_OPP;
   const losToilet = getQty("_los_toilet") > 0;
   const s2pActive = getQty("_s2p") > 0;
+  const afbouwniveau = getQty("_afbouwniveau") || 2; // default Q2 / Klasse C
 
   const aantalVoordeuren = aantalWoningen;
   const voordeurRaw = inputs.find((i) => i.inputLabel === "_voordeur_in_kozijn");
@@ -376,6 +377,20 @@ export function StructuredInputs({ buildingId, inputs, modules, onChanged, known
               <SelectItem value="1">Budget</SelectItem>
               <SelectItem value="2">Middel</SelectItem>
               <SelectItem value="3">Duur</SelectItem>
+            </SelectContent>
+          </Select>
+        </FieldRow>
+        <FieldRow label="Afbouwniveau">
+          <Select
+            value={String(afbouwniveau)}
+            onValueChange={(v) => upsertInputs({ _afbouwniveau: parseInt(v) })}
+          >
+            <SelectTrigger className="h-7 w-full text-xs"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="1">Q1 / Klasse E (afgewerkt · 0,10 u/m²)</SelectItem>
+              <SelectItem value="4">Q1+spuit (spachtelputz · 0,23 u/m²)</SelectItem>
+              <SelectItem value="2">Q2 / Klasse C (glad — normaal · 0,30 u/m²)</SelectItem>
+              <SelectItem value="3">Q4 / Klasse A (zeer hoog · 1,00 u/m²)</SelectItem>
             </SelectContent>
           </Select>
         </FieldRow>

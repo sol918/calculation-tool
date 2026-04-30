@@ -11,6 +11,7 @@ import {
   DEFAULT_LABOUR_RATES, DEFAULT_EFFICIENCY, COST_GROUP_LABELS, BASIS_LABELS,
 } from "@/lib/calculation";
 import type { CostGroup } from "@/types";
+import { STANDARD_CATEGORIES, CATEGORY_GROUP_ORDER, CATEGORY_GROUP_LABELS } from "@/lib/kengetal-categories";
 import { eq } from "drizzle-orm";
 
 // Kleuren (RGB in ARGB hex voor ExcelJS).
@@ -470,7 +471,7 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
       row++;
       const labStart = row;
 
-      const collapse = (l: string) => l.replace(/^Modules (begane grond|dak|tussenverdieping)(\s—|$)/, "Modules$2");
+      const collapse = (l: string) => l.replace(/^Module Aant (BG|Dak|Tussenvd)(\s—|$)/, "Module Aant$2");
       const agg = new Map<string, { qty: number; rate: number; cost: number; unit: string }>();
       for (const { e, mult } of labourEntries) {
         const key = collapse(e.inputLabel);
@@ -615,16 +616,16 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
     const lastMarkupRow = renderMarkupsForGroup(groupKey, directRef);
 
     // Subtotaal incl. opslagen — alleen als er markups in deze groep zaten.
+    // SUBTOTAL(9, range) skipt zichzelf-genest, dus bevat exact: leaves + markups
+    // (alle direct-/cat-/lab-/transport-SUBTOTAL-cellen worden overgeslagen).
+    // Hierdoor telt het grand-total deze rij niet dubbel.
     if (lastMarkupRow > 0) {
       const inclRow = row;
       setRow(inclRow, [`Subtotaal ${displayLabel.toLowerCase()} (incl. opslagen)`, null, null, null, null, null, null, null], {
         bold: true, indent: 1, fill: COLOR.brandSoft,
       });
-      const markupRefs = markupAmountCells[groupKey];
       ws.getCell(`G${inclRow}`).value = {
-        formula: markupRefs.length > 0
-          ? `${directRef}+${markupRefs.join("+")}`
-          : directRef,
+        formula: `SUBTOTAL(9,G${groupDataStart}:G${lastMarkupRow})`,
       };
       ws.getCell(`G${inclRow}`).numFmt = EUR;
       ws.getCell(`G${inclRow}`).font = { name: "Inter", size: 10, bold: true, color: { argb: COLOR.brand } };
@@ -739,14 +740,15 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
         row++;
       }
     }
-    if (engHasData) {
+    if (engHasData && engineeringRows.length > 0) {
       const engSubRow = row;
       setRow(engSubRow, ["Subtotaal engineering", null, null, null, null, null, null, null], {
         bold: true, indent: 1, borderTop: true, fill: COLOR.brandSoft,
       });
-      ws.getCell(`G${engSubRow}`).value = engineeringRows.length > 0
-        ? { formula: engineeringRows.map((rr) => `G${rr}`).join("+") }
-        : 0;
+      // SUBTOTAL over de eng-leaf rijen — net als alle andere subtotalen.
+      const firstEng = engineeringRows[0];
+      const lastEng = engineeringRows[engineeringRows.length - 1];
+      ws.getCell(`G${engSubRow}`).value = { formula: `SUBTOTAL(9,G${firstEng}:G${lastEng})` };
       ws.getCell(`G${engSubRow}`).numFmt = EUR;
       ws.getCell(`G${engSubRow}`).font = { name: "Inter", size: 10, bold: true };
       row++;
@@ -888,9 +890,11 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
   const ws2BpAsmRows: number[] = [];
 
   // Render markups inline voor één groep in ws2 (zelfde patroon als hoofd-tab).
-  const ws2RenderMarkups = (groupKey: CostGroup, directRef: string) => {
+  // Returnt het laatste rij-nr (voor "Subtotaal incl. opslagen"-SUBTOTAL).
+  const ws2RenderMarkups = (groupKey: CostGroup, directRef: string): number => {
     const groupMarkups = sortedMarkups.filter((m) => m.costGroup === groupKey);
-    if (groupMarkups.length === 0) return;
+    if (groupMarkups.length === 0) return -1;
+    let lastRow = -1;
     for (const m of groupMarkups) {
       const typeLabel = m.type === "percentage" ? "%" : m.type === "per_m2" ? "€/m²" : "vast";
       const basisLabel = m.type === "percentage" ? BASIS_LABELS[m.basis] ?? "—" : "—";
@@ -930,8 +934,10 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
       ws2.getCell(`H${rn}`).numFmt = EUR;
       ws2.getCell(`H${rn}`).font = { name: "Inter", size: 10, bold: true };
       ws2MarkupCells[groupKey].push(`H${rn}`);
+      lastRow = rn;
       r2++;
     }
+    return lastRow;
   };
 
   for (const { key: groupKey, label: displayLabel, fill: fillColor } of orderedGroups) {
@@ -1035,15 +1041,15 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
     r2++;
 
     // Markups inline.
-    ws2RenderMarkups(groupKey, `H${directSubRow}`);
+    const lastMk = ws2RenderMarkups(groupKey, `H${directSubRow}`);
 
-    // Subtotaal incl. opslagen.
-    if ((ws2MarkupCells[groupKey] ?? []).length > 0) {
+    // Subtotaal incl. opslagen — SUBTOTAL(9, range) skipt de geneste subtotalen.
+    if (lastMk > 0) {
       const inclRow = r2;
       setRow2(inclRow, [`Subtotaal ${displayLabel.toLowerCase()} (incl. opslagen)`, null, null, null, null, null, null, null], {
         bold: true, indent: 1, fill: COLOR.brandSoft,
       });
-      ws2.getCell(`H${inclRow}`).value = { formula: `H${directSubRow}+${ws2MarkupCells[groupKey].join("+")}` };
+      ws2.getCell(`H${inclRow}`).value = { formula: `SUBTOTAL(9,H${groupDataStart}:H${lastMk})` };
       ws2.getCell(`H${inclRow}`).numFmt = EUR;
       ws2.getCell(`H${inclRow}`).font = { name: "Inter", size: 10, bold: true, color: { argb: COLOR.brand } };
       r2++;
@@ -1142,13 +1148,13 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
         r2++;
       }
     }
-    if (engHasData) {
+    if (engHasData && engCells.length > 0) {
       setRow2(r2, ["Subtotaal engineering", null, null, null, null, null, null, null], {
         bold: true, indent: 1, fill: COLOR.brandSoft,
       });
-      ws2.getCell(`H${r2}`).value = engCells.length > 0
-        ? { formula: engCells.map((rr) => `H${rr}`).join("+") }
-        : 0;
+      const firstEng = engCells[0];
+      const lastEng = engCells[engCells.length - 1];
+      ws2.getCell(`H${r2}`).value = { formula: `SUBTOTAL(9,H${firstEng}:H${lastEng})` };
       ws2.getCell(`H${r2}`).numFmt = EUR;
       ws2.getCell(`H${r2}`).font = { name: "Inter", size: 10, bold: true };
       r2++;
@@ -1180,52 +1186,106 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
   ws2.views = [{ state: "frozen", ySplit: 1, showGridLines: false }];
   ws2.properties = { ...ws2.properties, outlineProperties: { summaryBelow: false, summaryRight: false } };
 
-  // ── Invoer-sectie (collapsed) — onder beide tabs ───────────────
-  // Lijst alle building_inputs per gebouw, ingeklapt zodat het Excel-bestand
-  // door de ontvanger snel gecheckt kan worden zonder dat het tabblad volstroomt.
-  const renderInvoerSection = (sheet: ExcelJS.Worksheet, startRow: number, ctx: "begroting" | "categorie"): number => {
-    let rr = startRow;
-    rr++;
-    sheet.mergeCells(`A${rr}:${ctx === "begroting" ? "H" : "H"}${rr}`);
-    const ihdr = sheet.getCell(`A${rr}`);
-    ihdr.value = "INVOER (collapsed — klik + om te tonen)";
-    ihdr.font = { name: "Inter", size: 11, bold: true, color: { argb: COLOR.headerText } };
-    ihdr.alignment = { vertical: "middle", indent: 1 };
-    ihdr.fill = { type: "pattern", pattern: "solid", fgColor: { argb: COLOR.surface } };
-    sheet.getRow(rr).height = 22;
-    rr++;
-    for (const b of projBuildings) {
-      const inputs = (inputsByBuilding.get(b.id) ?? [])
-        .filter((i) => !i.inputLabel.startsWith("_"))
-        .sort((a, b) => a.inputLabel.localeCompare(b.inputLabel, "nl"));
-      if (inputs.length === 0) continue;
-      const blockHeaderRow = rr;
-      sheet.getRow(rr).outlineLevel = 0;
-      const c1 = sheet.getCell(`A${rr}`);
-      c1.value = `Gebouw — ${b.name} (${b.count}×)`;
-      c1.font = { name: "Inter", size: 10, bold: true, color: { argb: COLOR.muted } };
-      c1.alignment = { indent: 1 };
-      sheet.getCell(`B${rr}`).value = `${inputs.length} velden`;
-      sheet.getCell(`B${rr}`).font = { name: "Inter", size: 9, color: { argb: COLOR.muted } };
-      rr++;
-      for (const inp of inputs) {
-        sheet.getRow(rr).outlineLevel = 1;
-        sheet.getRow(rr).hidden = true;
-        sheet.getCell(`A${rr}`).value = inp.inputLabel;
-        sheet.getCell(`A${rr}`).font = { name: "Inter", size: 10 };
-        sheet.getCell(`A${rr}`).alignment = { indent: 2 };
-        sheet.getCell(`B${rr}`).value = inp.quantity;
-        sheet.getCell(`B${rr}`).numFmt = NUM;
-        sheet.getCell(`B${rr}`).font = { name: "Inter", size: 10 };
-        sheet.getCell(`B${rr}`).alignment = { horizontal: "right" };
-        rr++;
-      }
-    }
-    return rr;
-  };
+  // ── Derde tab: "Invoer" ────────────────────────────────────────
+  // Toont alle STANDARD_CATEGORIES (alle 33+ invoercategorieën) per gebouw met
+  // de daadwerkelijk-gebruikte hoeveelheid. Ontvanger ziet in één blik welke
+  // input is gebruikt voor de begroting; lege velden zijn 0.
+  const ws3 = wb.addWorksheet("Invoer", {
+    views: [{ state: "normal", showGridLines: false, zoomScale: 100 }],
+    properties: { outlineLevelRow: 1 },
+  });
+  // Kolommen: A=label, B=eenheid, C+=per-gebouw qty.
+  const buildingCols = projBuildings;
+  ws3.columns = [
+    { width: 36 },
+    { width: 8 },
+    ...buildingCols.map(() => ({ width: 14 })),
+    { width: 10 }, // groep-kolom rechts
+  ];
 
-  row = renderInvoerSection(ws, row, "begroting");
-  r2 = renderInvoerSection(ws2, r2, "categorie");
+  const STD = STANDARD_CATEGORIES;
+  const GRP_ORDER = CATEGORY_GROUP_ORDER;
+  const GRP_LABEL = CATEGORY_GROUP_LABELS;
+
+  let r3 = 1;
+  ws3.mergeCells(`A${r3}:${String.fromCharCode(66 + buildingCols.length + 1)}${r3}`);
+  const t3 = ws3.getCell(`A${r3}`);
+  t3.value = "INVOER — alle invoercategorieën per gebouw";
+  t3.font = { name: "Inter", size: 11, bold: true, color: { argb: COLOR.white } };
+  t3.alignment = { vertical: "middle", indent: 1 };
+  t3.fill = { type: "pattern", pattern: "solid", fgColor: { argb: COLOR.totalsDark } };
+  ws3.getRow(r3).height = 22;
+  r3++;
+  r3++;
+
+  // Header-rij.
+  const headerRow = r3;
+  ws3.getCell(`A${headerRow}`).value = "Invoercategorie";
+  ws3.getCell(`B${headerRow}`).value = "Eh";
+  buildingCols.forEach((b, i) => {
+    const col = String.fromCharCode(67 + i); // C,D,E,...
+    const cell = ws3.getCell(`${col}${headerRow}`);
+    cell.value = `${b.name}${b.count > 1 ? ` (${b.count}×)` : ""}`;
+    cell.font = { name: "Inter", size: 10, bold: true };
+    cell.alignment = { horizontal: "right" };
+  });
+  const groupCol = String.fromCharCode(67 + buildingCols.length);
+  ws3.getCell(`${groupCol}${headerRow}`).value = "Groep";
+  ws3.getRow(headerRow).font = { name: "Inter", size: 10, bold: true, color: { argb: COLOR.muted } };
+  ws3.getRow(headerRow).fill = { type: "pattern", pattern: "solid", fgColor: { argb: COLOR.rowAlt } };
+  r3++;
+
+  // Group input-categories door de hoofdgroep.
+  const stdByGroup = new Map<string, typeof STD>();
+  for (const s of STD) {
+    const list = stdByGroup.get(s.group) ?? [];
+    list.push(s);
+    stdByGroup.set(s.group, list);
+  }
+
+  for (const grp of GRP_ORDER) {
+    const items = stdByGroup.get(grp);
+    if (!items || items.length === 0) continue;
+    // Group-header rij.
+    ws3.mergeCells(`A${r3}:${groupCol}${r3}`);
+    const gHdr = ws3.getCell(`A${r3}`);
+    gHdr.value = GRP_LABEL[grp].toUpperCase();
+    gHdr.font = { name: "Inter", size: 10, bold: true, color: { argb: COLOR.headerText } };
+    gHdr.alignment = { vertical: "middle", indent: 1 };
+    gHdr.fill = { type: "pattern", pattern: "solid", fgColor: { argb: COLOR.surface } };
+    ws3.getRow(r3).height = 18;
+    r3++;
+    for (const cat of items) {
+      const rn = r3;
+      ws3.getCell(`A${rn}`).value = cat.label;
+      ws3.getCell(`A${rn}`).font = { name: "Inter", size: 10 };
+      ws3.getCell(`A${rn}`).alignment = { indent: 1 };
+      ws3.getCell(`B${rn}`).value = cat.unit;
+      ws3.getCell(`B${rn}`).font = { name: "Inter", size: 9, color: { argb: COLOR.muted } };
+      buildingCols.forEach((b, i) => {
+        const col = String.fromCharCode(67 + i);
+        const inputs = inputsByBuilding.get(b.id) ?? [];
+        const direct = inputs.find((x) => x.inputLabel === cat.label);
+        let qty: number = direct?.quantity ?? 0;
+        // Voor module-derived labels: lees uit buildingResults effectiveInputs (incl. derivaties).
+        if (qty === 0) {
+          const br = buildingResults.find((x) => x.building.id === b.id);
+          qty = br?.effectiveInputs[cat.label] ?? 0;
+        }
+        const cell = ws3.getCell(`${col}${rn}`);
+        cell.value = qty;
+        cell.numFmt = NUM;
+        cell.font = { name: "Inter", size: 10 };
+        cell.alignment = { horizontal: "right" };
+      });
+      ws3.getCell(`${groupCol}${rn}`).value = cat.subgroup;
+      ws3.getCell(`${groupCol}${rn}`).font = { name: "Inter", size: 9, color: { argb: COLOR.muted } };
+      r3++;
+    }
+  }
+
+  ws3.views = [{ state: "frozen", ySplit: headerRow, showGridLines: false }];
+  ws3.properties = { ...ws3.properties, outlineProperties: { summaryBelow: false, summaryRight: false } };
 
   // ── Write + return ─────────────────────────────────────────────
   const buf = await wb.xlsx.writeBuffer();

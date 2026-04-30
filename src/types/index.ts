@@ -3,6 +3,7 @@ import type {
   organizations, users, materials, kengetalSets, kengetalRows, kengetalLabour,
   projects, buildings, buildingInputs, overrides,
   vehicleTypes, projectTransport, modules, markupRows, labourRates,
+  projectExtraLines,
 } from "@/lib/db/schema";
 
 export type Organization = InferSelectModel<typeof organizations>;
@@ -20,6 +21,7 @@ export type ProjectTransport = InferSelectModel<typeof projectTransport>;
 export type Module = InferSelectModel<typeof modules>;
 export type MarkupRow = InferSelectModel<typeof markupRows>;
 export type LabourRates = InferSelectModel<typeof labourRates>;
+export type ProjectExtraLine = InferSelectModel<typeof projectExtraLines>;
 
 export type OrgRole = "owner" | "assembler" | "developer";
 export type ProjectStatus = "draft" | "final" | "closed";
@@ -151,6 +153,9 @@ export interface ProjectCalcResult {
    *  project-brede overhead. Worden in de begroting onder "Arbeid" in Assemblagehal
    *  getoond. Onder per-gebouw-scope proportioneel verdeeld o.b.v. modules. */
   projectLevelLabour: CategoryLabourEntry[];
+  /** Per-project handmatige posten — al opgeteld bij de juiste group.materialCost.
+   *  Voor weergave in de begroting (eigen sectie per groep). */
+  extraLines: ProjectExtraLine[];
 
   totaalExDerden: number;  // bouwpakket + installateur + assemblagehal subtotals
   preProjectMarkups: number; // totaalExDerden + derden.subtotal + hoofdaannemer.subtotal
@@ -180,9 +185,9 @@ export interface SessionUser {
 export const MODULE_DERIVED_LABELS = {
   AREA: "Module oppervlak",   // Σ(L × W × count) m²
   COUNT: "Aantal modules",     // Σ(count) — interne totale telling; niet meer als standaard-categorie
-  COUNT_BG: "Modules begane grond",       // modules op begane grond
-  COUNT_DAK: "Modules dak",               // modules met dakopbouw
-  COUNT_TUSSEN: "Modules tussenverdieping", // modules op tussenverdiepingen
+  COUNT_BG: "Module Aant BG",          // modules op begane grond
+  COUNT_DAK: "Module Aant Dak",        // modules met dakopbouw
+  COUNT_TUSSEN: "Module Aant Tussenvd", // modules op tussenverdiepingen
   WIDTH_TOTAL: "Module breedte totaal",   // Σ(W × count) m
   LENGTH_TOTAL: "Module lengte totaal",   // Σ(L × count) m
   HEIGHT_TOTAL: "Module hoogte totaal",   // Σ(H × count) m

@@ -14,6 +14,7 @@
 import type {
   Material, KengetalRow, KengetalLabour, Building, BuildingInput, Override,
   ProjectTransport, VehicleType, Project, Module, MarkupRow, LabourRates,
+  ProjectExtraLine,
   MaterialCalcRow, MaterialContribution, BuildingCalcResult, CategoryLabourEntry, MarkupCalcRow, ProjectCalcResult,
   CostGroup, GroupTotals, KengetalSet,
 } from "@/types";
@@ -833,6 +834,53 @@ export function calculateBuilding(
     });
   }
 
+  // Afbouwniveau (Q1/E · Q2/C · Q4/A) — één arbeidspost per gebouw, op basis van
+  // totaal afgewerkt oppervlak: plafond + dak + dichte gevel + WSW (×hoogte×2 zijden)
+  // + binnenwand (×hoogte×2 zijden). Werkt voor zowel .home als .optop omdat we
+  // alle relevante WSW-labels meetellen (de inactieve labels zijn 0).
+  const afbouwLevel = Math.round(effectiveInputs["_afbouwniveau"] ?? 2);
+  // Level-IDs blijven backwards-compatible: 1=Q1, 2=Q2, 3=Q4. ID 4 = Q1+spuit
+  // (toegevoegd na Q1 in de UI; nieuwe ID zodat bestaande data niet schuift).
+  const afbouwTable: Record<number, { uren: number; label: string }> = {
+    1: { uren: 0.10, label: "Q1 / Klasse E (afgewerkt)" },
+    4: { uren: 0.23, label: "Q1+spuit (spachtelputz / spuitwerk)" },
+    2: { uren: 0.30, label: "Q2 / Klasse C (glad — normale eisen)" },
+    3: { uren: 1.00, label: "Q4 / Klasse A (zeer hoge eisen)" },
+  };
+  const afbouwCfg = afbouwTable[afbouwLevel];
+  if (afbouwCfg && afbouwCfg.uren > 0 && rates.assemblageHourlyRate > 0) {
+    // Avg modulehoogte voor 2D-conversie van WSW/binnenwand m¹ → m².
+    let totalCnt = 0, hWeighted = 0;
+    for (const m of mods) { totalCnt += m.count; hWeighted += m.heightM * m.count; }
+    const avgHoogte = totalCnt > 0 ? hWeighted / totalCnt : 3.155;
+
+    const plafondM2  = effectiveInputs["Module Opp Plafond"] ?? 0;
+    const dakM2      = effectiveInputs["Module Opp Dak"] ?? effectiveInputs["Dakoppervlak"] ?? 0;
+    const dichteM2   = effectiveInputs["Dichte gevel"] ?? 0;
+    const wswM1      =
+        (effectiveInputs["WSW"] ?? 0)
+      + (effectiveInputs["Verzwaarde WSW"] ?? 0)
+      + (effectiveInputs["Extra verzwaarde WSW"] ?? 0)
+      + (effectiveInputs["WSW korte zijde"] ?? 0)
+      + (effectiveInputs["WSW lange zijde"] ?? 0);
+    const wswM2 = wswM1 * avgHoogte * 2; // beide zijden
+    const binnenwandM1 = effectiveInputs["Binnenwand"] ?? 0;
+    const binnenwandM2 = binnenwandM1 * avgHoogte * 2; // beide zijden
+
+    const afbouwOpp = plafondM2 + dakM2 + dichteM2 + wswM2 + binnenwandM2;
+    if (afbouwOpp > 0) {
+      const totalHours = afbouwOpp * afbouwCfg.uren * learnFactor;
+      labourEntries.push({
+        inputLabel: `Afbouw — ${afbouwCfg.label}`,
+        costGroup: "assemblagehal",
+        hoursPerInput: afbouwCfg.uren,
+        inputQty: afbouwOpp,
+        totalHours,
+        cost: totalHours * rates.assemblageHourlyRate,
+      });
+    }
+  }
+
   // S2P stelposten — telt prefab-badkamer-units mee als de S2P-vlag aan staat.
   // De materialen (S2PT/S2PBK_S/S2PBK_M/S2PBK_L) komen uit de seed; prijzen zijn
   // per-organisatie aanpasbaar via de materialenbibliotheek. Per-project
@@ -1129,6 +1177,10 @@ export function calculateProject(
   /** Aantal unieke moduletypes (L|W|H tuples) over het hele project. Drijft de
    *  type-penalty in computeProjectMgmtHours (50u per extra type na de eerste). */
   distinctModuleTypes: number = 1,
+  /** Per-project handmatige posten — tellen op bij de directe kosten van hun
+   *  cost-group. Werken als materiaal-rijen (qty × price) maar zonder verlies
+   *  of kengetal-link. Bewerkbaar via de begroting-UI. */
+  extraLines: ProjectExtraLine[] = [],
 ): ProjectCalcResult {
   const allRows = mergeAllRows(buildingResults);
 
@@ -1163,6 +1215,19 @@ export function calculateProject(
                   : arbeid;
       target.laborCost += e.cost * br.building.count;
     }
+  }
+
+  // Handmatige extra-posten per project — tellen op bij de materialCost van hun
+  // groep. Zo komen ze als directe kosten terecht en worden ze meegenomen door
+  // alle markup-formules op group_direct/cumulative/totaal_ex_derden basis.
+  for (const x of extraLines) {
+    const cost = (x.quantity ?? 0) * (x.pricePerUnit ?? 0);
+    if (cost === 0) continue;
+    const target = x.costGroup === "bouwpakket" ? bouwpakket
+                : x.costGroup === "installateur" ? installateur
+                : x.costGroup === "derden" ? derden
+                : assemblagehal;
+    target.materialCost += cost;
   }
 
   // Module-gedreven arbeid: arbeid buiten + projectmanagement (uren per module).
@@ -1355,6 +1420,7 @@ export function calculateProject(
     distinctModuleTypes,
     arbeidBuitenHours,
     projectLevelLabour,
+    extraLines,
     totaalExDerden, preProjectMarkups,
     projectMarkups, totalProjectMarkups,
     totalDirect, totalMaterial, totalLabor, totalTransport,

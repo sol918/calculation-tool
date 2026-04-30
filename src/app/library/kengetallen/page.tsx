@@ -12,7 +12,19 @@ import { deriveInputsFromModules } from "@/lib/calculation";
 import type { Building, BuildingInput, Module } from "@/types";
 import { ChevronRight, Plus, Trash2, Layers } from "lucide-react";
 import { AppHeader, HeaderContext } from "@/components/app-header";
-import { STANDARD_CATEGORIES, BOUWPAKKET_PROCESSING_CATEGORIES, BOUWPAKKET_PROCESSING_LABEL_SET } from "@/lib/kengetal-categories";
+import { STANDARD_CATEGORIES, BOUWPAKKET_PROCESSING_CATEGORIES, BOUWPAKKET_PROCESSING_LABEL_SET, CATEGORY_GROUP_ORDER, CATEGORY_GROUP_LABELS, SUBGROUP_COLORS } from "@/lib/kengetal-categories";
+import type { CategoryGroup, CategorySubgroup } from "@/lib/kengetal-categories";
+
+/** Invoer-labels die meedoen in de afbouwniveau-formule. Match met
+ *  calculation.ts (totaal afgewerkt oppervlak = som van deze m²/m¹ × hoogte × 2). */
+const AFBOUW_SURFACE_LABELS = new Set([
+  "Module Opp Plafond",
+  "Module Opp Dak",
+  "Dichte gevel",
+  "WSW", "Verzwaarde WSW", "Extra verzwaarde WSW",
+  "WSW korte zijde", "WSW lange zijde",
+  "Binnenwand",
+]);
 import type { KengetalSet, KengetalRow, KengetalLabour, Material } from "@/types";
 
 export default function KengetallenLibraryPage() {
@@ -105,30 +117,81 @@ export default function KengetallenLibraryPage() {
   // zodat geen categorie "verborgen" is voor de gebruiker.
   // (Bewerkings-categorieën Gezaagd / CNC / Kramerijen zijn géén top-level
   // invoercategorieën — die komen inline onder een categorie-detail.)
+  type CatEntry = { label: string; unit: string; count: number; isStandard: boolean; group: CategoryGroup; subgroup: CategorySubgroup | null };
   const allCategories = useMemo(() => {
-    const merged = new Map<string, { label: string; unit: string; count: number; isStandard: boolean }>();
+    const merged = new Map<string, CatEntry>();
     for (const s of STANDARD_CATEGORIES) {
       const match = labelGroups.get(s.label);
-      merged.set(s.label, { label: s.label, unit: s.unit, count: match?.rows.length ?? 0, isStandard: true });
+      merged.set(s.label, { label: s.label, unit: s.unit, count: match?.rows.length ?? 0, isStandard: true, group: s.group, subgroup: s.subgroup });
     }
     for (const [label, g] of labelGroups) {
       if (merged.has(label)) continue;
-      if (BOUWPAKKET_PROCESSING_LABEL_SET.has(label)) continue; // niet als top-level tonen
-      merged.set(label, { label, unit: g.unit, count: g.rows.length, isStandard: false });
+      if (BOUWPAKKET_PROCESSING_LABEL_SET.has(label)) continue;
+      merged.set(label, { label, unit: g.unit, count: g.rows.length, isStandard: false, group: "overig", subgroup: null });
     }
-    // Labour-only labels (bv. "Module oppervlak" uit kengetal_labour zonder materiaalrijen).
     for (const lr of labour) {
       if (merged.has(lr.inputLabel)) continue;
       if (BOUWPAKKET_PROCESSING_LABEL_SET.has(lr.inputLabel)) continue;
-      // Unit afleiden: gebruik gangbare default per label-type.
       const unit = /oppervlak|Opp /i.test(lr.inputLabel) ? "m²"
         : /Aantal|Badkamers|toilet|kozijnen|voordeuren|binnendeuren|Balkons stuks/i.test(lr.inputLabel) ? "stuks"
         : /lengte|breedte|Binnenwand|WSW|omtrek|m1|m¹/i.test(lr.inputLabel) ? "m¹"
         : "stuks";
-      merged.set(lr.inputLabel, { label: lr.inputLabel, unit, count: 0, isStandard: false });
+      merged.set(lr.inputLabel, { label: lr.inputLabel, unit, count: 0, isStandard: false, group: "overig", subgroup: null });
     }
     return Array.from(merged.values());
   }, [labelGroups, labour]);
+
+  // Gegroepeerd voor het linker-paneel. Volgorde van labels per groep volgt
+  // STANDARD_CATEGORIES; custom labels komen onder "Overig".
+  const groupedCategories = useMemo(() => {
+    const order = new Map(STANDARD_CATEGORIES.map((s, i) => [s.label, i]));
+    const byGroup = new Map<CategoryGroup, CatEntry[]>();
+    for (const c of allCategories) {
+      const list = byGroup.get(c.group) ?? [];
+      list.push(c);
+      byGroup.set(c.group, list);
+    }
+    for (const list of byGroup.values()) {
+      list.sort((a, b) => (order.get(a.label) ?? 999) - (order.get(b.label) ?? 999));
+    }
+    return CATEGORY_GROUP_ORDER.map((g) => ({ group: g, items: byGroup.get(g) ?? [] })).filter((x) => x.items.length > 0);
+  }, [allCategories]);
+
+  // Per-label totaal qty + materiaal-kosten in het project (alle gebouwen die
+  // dit bouwsysteem gebruiken). Resulteert in { qty, cost } voor elke standard
+  // category — getoond rechts op de invoer-rij in grijs ter check.
+  const projectTotals = useMemo(() => {
+    const totals = new Map<string, { qty: number; cost: number }>();
+    if (!projectId || projectBuildings.length === 0) return totals;
+    const matById = new Map(materials.map((m) => [m.id, m]));
+    const rateMap = new Map(rows.map((r) => [`${r.inputLabel}|${r.materialId}`, r]));
+
+    for (const pb of projectBuildings) {
+      if (pb.building.kengetalSetId && pb.building.kengetalSetId !== activeSetId) continue;
+      const oppBGG = pb.inputs.find((i) => i.inputLabel === "_opp_begane_grond")?.quantity ?? 0;
+      const derived = deriveInputsFromModules(pb.modules, oppBGG);
+      const eff: Record<string, number> = {};
+      for (const inp of pb.inputs) eff[inp.inputLabel] = inp.quantity;
+      for (const [k, v] of Object.entries(derived)) eff[k] = v;
+      const buildingMult = pb.building.count || 1;
+
+      for (const c of allCategories) {
+        const qty = (eff[c.label] ?? 0) * buildingMult;
+        let cost = 0;
+        // Som van (qty × ratio × (1+loss) × prijs) over alle kengetal-rijen voor dit label.
+        for (const kg of rows.filter((r) => r.inputLabel === c.label)) {
+          const mat = matById.get(kg.materialId);
+          if (!mat) continue;
+          cost += qty * kg.ratio * (1 + mat.lossPct) * mat.pricePerUnit;
+        }
+        const ex = totals.get(c.label) ?? { qty: 0, cost: 0 };
+        ex.qty += qty;
+        ex.cost += cost;
+        totals.set(c.label, ex);
+      }
+    }
+    return totals;
+  }, [projectBuildings, allCategories, rows, materials, activeSetId, projectId]);
 
   const selectedUnit = (selectedLabel
     ? (labelGroups.get(selectedLabel)?.unit ?? STANDARD_CATEGORIES.find((s) => s.label === selectedLabel)?.unit)
@@ -274,33 +337,56 @@ export default function KengetallenLibraryPage() {
         )}
 
         <div className="grid gap-4 md:grid-cols-[340px_1fr]">
-          {/* Left: input-label overview — union of standard categories + custom labels */}
+          {/* Left: input-label overview — gegroepeerd op modules / gevels / wanden /
+              installaties / overig, met sub-groep kleurindicator zodat verwante
+              labels (b.v. alle Module Opp X) in één tint staan. */}
           <div className="rounded-md border bg-white">
             <div className="flex items-center justify-between border-b px-3 py-2 text-xs">
               <span className="font-semibold">Invoercategorieën</span>
               <span className="text-muted-foreground">{allCategories.length}</span>
             </div>
-            <div className="max-h-[70vh] overflow-auto">
-              {allCategories.map((c) => {
-                const active = selectedLabel === c.label;
-                return (
-                  <button
-                    key={c.label}
-                    onClick={() => setSelectedLabel(c.label)}
-                    className={`flex w-full items-center justify-between border-b px-3 py-2 text-left text-xs last:border-0 hover:bg-gray-50 ${active ? "bg-gray-50" : ""} ${c.count === 0 ? "text-muted-foreground" : ""}`}
-                    style={active ? { borderLeft: "3px solid var(--system-tint)" } : undefined}
-                  >
-                    <div>
-                      <div className="font-medium text-foreground">{c.label}</div>
-                      <div className="text-[10px] text-muted-foreground">
-                        {c.count} materialen · eenheid {c.unit}
-                        {!c.isStandard && " · custom"}
-                      </div>
-                    </div>
-                    <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
-                  </button>
-                );
-              })}
+            <div className="max-h-[75vh] overflow-auto">
+              {groupedCategories.map(({ group, items }) => (
+                <div key={group}>
+                  <div className="sticky top-0 z-10 border-b bg-gray-50 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                    {CATEGORY_GROUP_LABELS[group]}
+                  </div>
+                  {items.map((c) => {
+                    const active = selectedLabel === c.label;
+                    const colors = c.subgroup ? SUBGROUP_COLORS[c.subgroup] : null;
+                    const totals = projectTotals.get(c.label);
+                    return (
+                      <button
+                        key={c.label}
+                        onClick={() => setSelectedLabel(c.label)}
+                        className={`flex w-full items-stretch border-b text-left text-xs last:border-0 hover:bg-gray-50 ${active ? "bg-gray-50" : ""} ${c.count === 0 ? "text-muted-foreground" : ""}`}
+                      >
+                        <div
+                          className="w-1 shrink-0"
+                          style={{ backgroundColor: colors ? colors.bar : "transparent" }}
+                          title={colors?.label}
+                        />
+                        <div className="flex flex-1 items-center justify-between px-3 py-2">
+                          <div className="min-w-0">
+                            <div className="truncate font-medium text-foreground">{c.label}</div>
+                            <div className="truncate text-[10px] text-muted-foreground">
+                              {c.count} materialen · {c.unit}
+                              {!c.isStandard && " · custom"}
+                              {totals && totals.qty > 0 && (
+                                <span className="ml-1 text-[10px] text-gray-400">
+                                  · {formatNumber(totals.qty, totals.qty < 10 ? 1 : 0)} {c.unit}
+                                  {totals.cost > 0 && ` · €${formatNumber(totals.cost, 0)}`}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                          <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              ))}
             </div>
           </div>
 
@@ -328,89 +414,106 @@ export default function KengetallenLibraryPage() {
               </div>
             )}
 
-            {selectedLabel && (
-              <div className="border-b px-3 py-2 text-[11px]">
-                <div className="mb-2 text-muted-foreground">
-                  Invoer in <span className="font-medium text-foreground">{selectedUnit}</span>.
-                  Ratio = materiaal per {selectedUnit}.
+            {selectedLabel && (() => {
+              const isAfbouwSurface = AFBOUW_SURFACE_LABELS.has(selectedLabel);
+              // Grid-kolommen ZELFDE als de materiaal-tabel hieronder, zodat de
+              // input-cellen verticaal uitlijnen met de Ratio-kolom van de tabel.
+              //   col1 (1fr) = label · col2 (5rem) = empty · col3 (5rem) = input
+              //   col4 (5rem) = unit · col5 (rest) = bestemming-hint
+              // Grid-kolommen ZELFDE als de materiaal-tabel (nu zonder "Groep"-col):
+              //   col1 (1fr) = label · col2 (5rem) = input · col3 (5rem) = eenheid
+              //   col4 (7rem) = hint
+              const labRow = (label: string, value: number, key: string, onSave: (v: number) => void, dest: string, auto?: boolean) => (
+                <div className="grid grid-cols-[1fr_5rem_5rem_7rem] items-center gap-x-2 px-3 py-1.5 text-[11px]">
+                  <span className="font-medium text-foreground">{label}{auto && <span className="ml-1 text-[10px] text-muted-foreground">(auto)</span>}</span>
+                  {auto || !canEdit ? (
+                    <span className="text-right tabular-nums text-muted-foreground">{formatNumber(value, 4)}</span>
+                  ) : (
+                    <Input
+                      key={key}
+                      className="h-7 w-full text-right text-xs tabular-nums"
+                      inputMode="decimal"
+                      defaultValue={value}
+                      onBlur={(e) => {
+                        const raw = e.target.value.replace(",", ".").trim();
+                        if (raw === "") return;
+                        const v = parseFloat(raw);
+                        if (!isNaN(v) && v !== value) onSave(v);
+                      }}
+                    />
+                  )}
+                  <span className="text-[10px] text-muted-foreground">u/{selectedUnit}</span>
+                  <span className="text-[10px] text-muted-foreground"><span className="opacity-60">→ {dest}</span></span>
                 </div>
-                <div className="grid grid-cols-[auto_6rem_auto] items-center gap-x-2 gap-y-1.5">
-                  <span className="font-medium text-foreground">Assemblagearbeid</span>
-                  {canEdit ? (
-                    <Input
-                      key={`lab-asm-${selectedLabel}-${selectedLabour?.hoursPerInput ?? 0}`}
-                      className="h-7 w-20 text-right text-xs tabular-nums"
-                      inputMode="decimal"
-                      defaultValue={selectedLabour?.hoursPerInput ?? 0}
-                      onBlur={(e) => {
-                        const raw = e.target.value.replace(",", ".").trim();
-                        if (raw === "") return;
-                        const v = parseFloat(raw);
-                        if (!isNaN(v) && v !== (selectedLabour?.hoursPerInput ?? 0)) {
-                          upsertLabour(selectedLabel, { hoursPerInput: v });
-                        }
-                      }}
-                    />
-                  ) : (
-                    <span className="tabular-nums">{selectedLabour?.hoursPerInput ?? 0}</span>
+              );
+              return (
+                <div className="border-b py-1 text-[11px]">
+                  <div className="mb-1 px-3 text-muted-foreground">
+                    Invoer in <span className="font-medium text-foreground">{selectedUnit}</span>.
+                    Ratio = materiaal per {selectedUnit}.
+                  </div>
+                  {labRow("Assemblagearbeid",
+                    selectedLabour?.hoursPerInput ?? 0,
+                    `lab-asm-${selectedLabel}-${selectedLabour?.hoursPerInput ?? 0}`,
+                    (v) => upsertLabour(selectedLabel, { hoursPerInput: v }),
+                    "arbeid",
                   )}
-                  <span className="text-[10px] text-muted-foreground">u/{selectedUnit} <span className="opacity-60">→ arbeid</span></span>
-
-                  <span className="font-medium text-foreground">Installatiearbeid</span>
-                  {canEdit ? (
-                    <Input
-                      key={`lab-inst-${selectedLabel}-${selectedLabour?.installatieHoursPerInput ?? 0}`}
-                      className="h-7 w-20 text-right text-xs tabular-nums"
-                      inputMode="decimal"
-                      defaultValue={selectedLabour?.installatieHoursPerInput ?? 0}
-                      onBlur={(e) => {
-                        const raw = e.target.value.replace(",", ".").trim();
-                        if (raw === "") return;
-                        const v = parseFloat(raw);
-                        if (!isNaN(v) && v !== (selectedLabour?.installatieHoursPerInput ?? 0)) {
-                          upsertLabour(selectedLabel, { installatieHoursPerInput: v });
-                        }
-                      }}
-                    />
-                  ) : (
-                    <span className="tabular-nums">{selectedLabour?.installatieHoursPerInput ?? 0}</span>
+                  {labRow("Installatiearbeid",
+                    selectedLabour?.installatieHoursPerInput ?? 0,
+                    `lab-inst-${selectedLabel}-${selectedLabour?.installatieHoursPerInput ?? 0}`,
+                    (v) => upsertLabour(selectedLabel, { installatieHoursPerInput: v }),
+                    "installateur",
                   )}
-                  <span className="text-[10px] text-muted-foreground">u/{selectedUnit} <span className="opacity-60">→ installateur</span></span>
-
-                  <span className="font-medium text-foreground">Arbeid buiten</span>
-                  {canEdit ? (
-                    <Input
-                      key={`lab-arbb-${selectedLabel}-${(selectedLabour as any)?.arbeidBuitenHrsPerInput ?? 0}`}
-                      className="h-7 w-20 text-right text-xs tabular-nums"
-                      inputMode="decimal"
-                      defaultValue={(selectedLabour as any)?.arbeidBuitenHrsPerInput ?? 0}
-                      onBlur={(e) => {
-                        const raw = e.target.value.replace(",", ".").trim();
-                        if (raw === "") return;
-                        const v = parseFloat(raw);
-                        const cur = (selectedLabour as any)?.arbeidBuitenHrsPerInput ?? 0;
-                        if (!isNaN(v) && v !== cur) {
-                          upsertLabour(selectedLabel, { arbeidBuitenHrsPerInput: v });
-                        }
-                      }}
-                    />
-                  ) : (
-                    <span className="tabular-nums">{(selectedLabour as any)?.arbeidBuitenHrsPerInput ?? 0}</span>
+                  {labRow("Arbeid buiten",
+                    (selectedLabour as any)?.arbeidBuitenHrsPerInput ?? 0,
+                    `lab-arbb-${selectedLabel}-${(selectedLabour as any)?.arbeidBuitenHrsPerInput ?? 0}`,
+                    (v) => upsertLabour(selectedLabel, { arbeidBuitenHrsPerInput: v }),
+                    "arbeid buiten",
                   )}
-                  <span className="text-[10px] text-muted-foreground">u/{selectedUnit} <span className="opacity-60">→ arbeid buiten</span></span>
+                  {/* Afbouw — read-only, alleen op afbouw-relevante oppervlakte-categorieën. */}
+                  {isAfbouwSurface && (() => {
+                    // Lees afbouwniveau uit eerste gebouw van het project (bij project-context).
+                    // Default 2 (Q2/C) als niets gekozen of geen project context.
+                    const RATES: Record<number, { uren: number; label: string }> = {
+                      1: { uren: 0.10, label: "Q1 / Klasse E" },
+                      4: { uren: 0.23, label: "Q1+spuit" },
+                      2: { uren: 0.30, label: "Q2 / Klasse C" },
+                      3: { uren: 1.00, label: "Q4 / Klasse A" },
+                    };
+                    const lvl = projectBuildings[0]?.inputs.find((i) => i.inputLabel === "_afbouwniveau")?.quantity;
+                    const lvlNum = lvl ? Math.round(lvl) : 2;
+                    const cfg = RATES[lvlNum] ?? RATES[2];
+                    return (
+                      <div className="grid grid-cols-[1fr_5rem_5rem_7rem] items-center gap-x-2 px-3 py-1.5 text-[11px]">
+                        <span className="font-medium text-foreground">
+                          Afbouw <span className="ml-1 text-[10px] text-muted-foreground">(auto · {cfg.label})</span>
+                        </span>
+                        <span className="text-right tabular-nums text-muted-foreground">{formatNumber(cfg.uren, 2)}</span>
+                        <span className="text-[10px] text-muted-foreground">u/m²</span>
+                        <span className="text-[10px] text-muted-foreground"><span className="opacity-60">→ assemblagehal</span></span>
+                      </div>
+                    );
+                  })()}
                 </div>
-              </div>
-            )}
+              );
+            })()}
 
             {selectedLabel && detailRows.length > 0 ? (
-              <table className="w-full text-xs">
+              <table className="w-full table-fixed text-xs">
+                <colgroup>
+                  <col />                         {/* Materiaal — flex */}
+                  <col className="w-[5rem]" />    {/* Ratio input */}
+                  <col className="w-[5rem]" />    {/* Eenheid */}
+                  <col className="w-[7rem]" />    {/* Toelichting */}
+                  {canEdit && <col className="w-8" />}
+                </colgroup>
                 <thead>
                   <tr className="border-b bg-gray-50 text-left text-[10px] uppercase tracking-wider text-muted-foreground">
                     <th className="px-3 py-1.5 font-medium">Materiaal</th>
-                    <th className="px-3 py-1.5 font-medium">Groep</th>
                     <th className="px-3 py-1.5 text-right font-medium">Ratio</th>
+                    <th className="px-3 py-1.5 font-medium">Eenheid</th>
                     <th className="px-3 py-1.5 font-medium">Toelichting</th>
-                    {canEdit && <th className="w-8" />}
+                    {canEdit && <th />}
                   </tr>
                 </thead>
                 <tbody>
@@ -432,30 +535,23 @@ export default function KengetallenLibraryPage() {
                           ) : (<span>{m?.code} — {m?.name}</span>)}
                         </td>
                         <td className="px-3 py-1">
-                          {m && (
-                            <span className="rounded bg-gray-100 px-1.5 py-0.5 text-[10px] text-muted-foreground">
-                              {COST_GROUP_LABELS[m.costGroup]}
-                            </span>
-                          )}
+                          {canEdit ? (
+                            <Input
+                              key={`${row.id}-ratio-${row.ratio}`}
+                              className="h-7 w-full text-right text-xs tabular-nums"
+                              inputMode="decimal"
+                              defaultValue={row.ratio}
+                              onBlur={(e) => {
+                                const raw = e.target.value.replace(",", ".").trim();
+                                if (raw === "") return;
+                                const v = parseFloat(raw);
+                                if (!isNaN(v) && v !== row.ratio) updateRow(row, { ratio: v });
+                              }}
+                            />
+                          ) : (<span className="block text-right tabular-nums">{row.ratio}</span>)}
                         </td>
                         <td className="px-3 py-1">
-                          <div className="flex items-center justify-end gap-1.5">
-                            {canEdit ? (
-                              <Input
-                                key={`${row.id}-ratio-${row.ratio}`}
-                                className="h-7 w-20 text-right text-xs tabular-nums"
-                                inputMode="decimal"
-                                defaultValue={row.ratio}
-                                onBlur={(e) => {
-                                  const raw = e.target.value.replace(",", ".").trim();
-                                  if (raw === "") return;
-                                  const v = parseFloat(raw);
-                                  if (!isNaN(v) && v !== row.ratio) updateRow(row, { ratio: v });
-                                }}
-                              />
-                            ) : (<span className="tabular-nums">{row.ratio}</span>)}
-                            <span className="inline-block w-20 shrink-0 whitespace-nowrap text-left text-[10px] text-muted-foreground">{ratioUnit}</span>
-                          </div>
+                          <div className="text-[10px] text-muted-foreground">{ratioUnit}</div>
                         </td>
                         <td className="px-3 py-1">
                           {canEdit ? (
