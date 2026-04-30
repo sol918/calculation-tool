@@ -157,7 +157,10 @@ export function StructuredInputs({ buildingId, inputs, modules, onChanged, known
   const aantalVoordeuren = aantalWoningen;
   const voordeurRaw = inputs.find((i) => i.inputLabel === "_voordeur_in_kozijn");
   const voordeurInKozijn = voordeurRaw ? voordeurRaw.quantity > 0 : true;
-  const voordeurExtraOpp = voordeurInKozijn ? 0 : aantalVoordeuren * KOZIJN_OPP_PER_STUK;
+  // Vinkje "voordeur in kozijn" is puur informatief voor de gevel-math: of de
+  // voordeur in de gevel zit (en al meegeteld is in % glas × geveltotaal) of aan
+  // de kernzijde (binnenwand) — in beide gevallen geen extra/aftrek op Open gevel.
+  const voordeurExtraOpp = 0;
 
   // ── Gevel-opp breakdown ──────────────────────────────────────────
   // Geveloppervlak = (gevellengte × avg hoogte) + dakrand-opstand (0,5m × dakomtrek).
@@ -207,8 +210,7 @@ export function StructuredInputs({ buildingId, inputs, modules, onChanged, known
 
   async function onVoordeurInKozijn(checked: boolean) {
     const newFlag = checked ? 1 : 0;
-    const newExtra = checked ? 0 : aantalVoordeuren * KOZIJN_OPP_PER_STUK;
-    await upsertInputs({ _voordeur_in_kozijn: newFlag, ...computeGevelUpdates({ vdrExtra: newExtra }) });
+    await upsertInputs({ _voordeur_in_kozijn: newFlag, ...computeGevelUpdates({ vdrExtra: 0 }) });
   }
 
   async function onAantalWoningen(v: number) {
@@ -218,9 +220,7 @@ export function StructuredInputs({ buildingId, inputs, modules, onChanged, known
     };
     if (binnenwandPerWoning > 0) updates["Binnenwand"] = binnenwandPerWoning * v;
     if (binnendeurenPerWoning > 0) updates["Aantal binnendeuren"] = Math.round(binnendeurenPerWoning * v);
-    if (!voordeurInKozijn) {
-      Object.assign(updates, computeGevelUpdates({ vdrExtra: v * KOZIJN_OPP_PER_STUK }));
-    }
+    Object.assign(updates, computeGevelUpdates({ vdrExtra: 0 }));
     await upsertInputs(updates);
   }
 

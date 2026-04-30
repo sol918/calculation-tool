@@ -4,7 +4,7 @@ import { db } from "@/lib/db";
 import {
   projects, buildings, modules as modulesTable, buildingInputs, overrides,
   materials, kengetalSets, kengetalRows, kengetalLabour,
-  projectTransport, vehicleTypes, markupRows, labourRates,
+  projectTransport, vehicleTypes, markupRows, labourRates, projectExtraLines,
 } from "@/lib/db/schema";
 import {
   calculateBuilding, calculateProject, computeLearningFactor, computeBvo, computeEngineering,
@@ -50,8 +50,12 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
   // "mat:{materialId}", "mk:{markupId}", "tr:{group}", "labgroup:{group}",
   // "lab:{group}:{inputLabel}". Elke "disabled" rij wordt overgeslagen in
   // de export — zo komt de Excel exact overeen met wat op het scherm staat.
-  const disabledParam = new URL(_req.url).searchParams.get("disabled") ?? "";
+  const _url = new URL(_req.url);
+  const disabledParam = _url.searchParams.get("disabled") ?? "";
   const disabled = new Set<string>(disabledParam.split(",").map((s) => decodeURIComponent(s.trim())).filter(Boolean));
+  // Sanity check is alleen voor interne validatie — niet meegeven aan klanten.
+  // Opt-in via ?sanity=1.
+  const includeSanity = _url.searchParams.get("sanity") === "1";
   const isOff = (key: string) => disabled.has(key);
   const isGroupOff = (g: string) => isOff(`grp:${g}`);
   const isCatOff = (g: string, cat: string) => isGroupOff(g) || isOff(`cat:${g}:${cat}`);
@@ -113,6 +117,7 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
   const allVt = await db.select().from(vehicleTypes);
   const transport = transportRaw.map((t) => ({ ...t, vehicleType: allVt.find((v) => v.id === t.vehicleTypeId) }));
   const mkRows = await db.select().from(markupRows).where(eq(markupRows.projectId, project.id));
+  const extraLines = await db.select().from(projectExtraLines).where(eq(projectExtraLines.projectId, project.id));
   const rates = await db.query.labourRates.findFirst({ where: eq(labourRates.orgId, project.ownerOrgId) })
     ?? DEFAULT_LABOUR_RATES;
 
@@ -150,9 +155,17 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
     gfaByBuildingId.set(br.building.id, computeBvo(br.effectiveInputs, setName));
   }
 
+  // Distinct moduletypes voor PM-formule (200 × n^0,434 + 50 × extra types).
+  const moduleTypeKeys = new Set<string>();
+  for (const b of projBuildings) {
+    for (const m of (modsByBuilding.get(b.id) ?? [])) {
+      moduleTypeKeys.add(`${m.lengthM}|${m.widthM}|${m.heightM}`);
+    }
+  }
   const calc = calculateProject(
     project, buildingResults, transport, mkRows, rates,
     "Module oppervlak", projLearn, gfaByBuildingId, autoAssemblageTransport,
+    moduleTypeKeys.size, extraLines,
   );
 
   // ── Build Excel ─────────────────────────────────────────────────
@@ -483,19 +496,30 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
           existing.qty += addQty;
           existing.cost += addCost;
         } else {
-          agg.set(key, { qty: addQty, rate: e.totalHours > 0 ? e.cost / e.totalHours : 0, cost: addCost, unit });
+          agg.set(key, { qty: addQty, rate: 0, cost: addCost, unit });
         }
       }
       if (groupKey === "bouwpakket") {
         const gez = { qty: 0, cost: 0 };
         const cnc = { qty: 0, cost: 0 };
+        const steen = { qty: 0, cost: 0 };
+        const overige = { qty: 0, cost: 0 };
         for (const [label, v] of agg) {
           if (label.endsWith("— gezaagd")) { gez.qty += v.qty; gez.cost += v.cost; }
           else if (label.endsWith("— CNC simpel") || label.endsWith("— CNC complex")) { cnc.qty += v.qty; cnc.cost += v.cost; }
+          else if (label.endsWith("— steenachtig")) { steen.qty += v.qty; steen.cost += v.cost; }
+          else { overige.qty += v.qty; overige.cost += v.cost; }
         }
         agg.clear();
-        if (gez.cost > 0) agg.set("Gezaagd", { qty: gez.qty, rate: gez.qty > 0 ? gez.cost / gez.qty : 0, cost: gez.cost, unit: "m³" });
-        if (cnc.cost > 0) agg.set("CNC",     { qty: cnc.qty, rate: cnc.qty > 0 ? cnc.cost / cnc.qty : 0, cost: cnc.cost, unit: "m³" });
+        if (gez.cost > 0)     agg.set("Gezaagd",     { qty: gez.qty,     rate: 0, cost: gez.cost,     unit: "m³" });
+        if (cnc.cost > 0)     agg.set("CNC",         { qty: cnc.qty,     rate: 0, cost: cnc.cost,     unit: "m³" });
+        if (steen.cost > 0)   agg.set("Steenachtig", { qty: steen.qty,   rate: 0, cost: steen.cost,   unit: "m³" });
+        if (overige.cost > 0) agg.set("Overig",      { qty: overige.qty, rate: 0, cost: overige.cost, unit: "m³" });
+      }
+      // Recompute rate als gewogen gemiddelde — `qty * rate = cost` moet exact
+      // kloppen, anders wijkt de Excel-formule (B*F) af van de echte cost.
+      for (const v of agg.values()) {
+        v.rate = v.qty > 0 ? v.cost / v.qty : 0;
       }
       const entries = Array.from(agg.entries()).sort(([, a], [, b]) => b.cost - a.cost);
       for (const [label, v] of entries) {
@@ -585,6 +609,34 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
       });
       ws.getCell(`G${trRow}`).numFmt = EUR;
       row++;
+    }
+
+    // Handmatige posten (per project) — tellen op bij de directe kosten van deze
+    // groep. Disabled-keys (xl:{id}) worden gerespecteerd via de UI-export.
+    const groupExtras = extraLines.filter((x) => x.costGroup === groupKey && !isOff(`xl:${x.id}`));
+    if (groupExtras.length > 0) {
+      const xlHeaderRow = row;
+      row++;
+      const xlStart = row;
+      for (const x of groupExtras) {
+        const rn = row;
+        ws.getRow(rn).outlineLevel = 1;
+        ws.getRow(rn).hidden = true;
+        // A=desc, B=qty, C=eh, D-E leeg, F=prijs, G=bedrag (=B*F), H leeg
+        setRow(rn, [x.description || "Handmatige post", x.quantity, x.unit, null, null, x.pricePerUnit, null, null], { indent: 2 });
+        ws.getCell(`G${rn}`).value = { formula: `B${rn}*F${rn}` };
+        ws.getCell(`B${rn}`).numFmt = NUM;
+        ws.getCell(`F${rn}`).numFmt = EUR;
+        ws.getCell(`G${rn}`).numFmt = EUR;
+        row++;
+      }
+      const xlEnd = row - 1;
+      setRow(xlHeaderRow, ["Handmatige posten", null, null, null, null, null, null, null], {
+        bold: true, indent: 1, fill: COLOR.rowAlt,
+      });
+      ws.getCell(`G${xlHeaderRow}`).value = { formula: `SUBTOTAL(9,G${xlStart}:G${xlEnd})` };
+      ws.getCell(`G${xlHeaderRow}`).numFmt = EUR;
+      ws.getCell(`G${xlHeaderRow}`).font = { name: "Inter", size: 10, bold: true };
     }
 
     const groupDataEnd = row - 1;
@@ -806,6 +858,232 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
   ws.getCell(`G${pricePerM2Row}`).numFmt = EUR;
   row++;
 
+  // ── Sanity check — server-side tracker ────────────────────────
+  // Berekent server-side EXACT wat Excel zou moeten optellen, gegeven dezelfde
+  // disabled-state filtering. JS-replica van de SUBTOTAL-formules: telt alle
+  // leaves op (materialen / arbeid / transport / extras / engineering) per groep,
+  // dan markup-bedragen via dezelfde TED/grand_total/bp+asm logica als calc.ts.
+  //
+  // Mismatch = formule-bug. Match = Excel formules berekenen wat ze moeten.
+  type GroupKey = "bouwpakket" | "installateur" | "assemblagehal" | "derden";
+  // Granulair: per groep × per component zodat we kunnen pinpointen waar Excel
+  // afwijkt. directs[g] = som van alle componenten.
+  const trackerComp: Record<GroupKey, { mat: number; lab: number; trans: number; extra: number; pm: number }> = {
+    bouwpakket:   { mat: 0, lab: 0, trans: 0, extra: 0, pm: 0 },
+    installateur: { mat: 0, lab: 0, trans: 0, extra: 0, pm: 0 },
+    assemblagehal:{ mat: 0, lab: 0, trans: 0, extra: 0, pm: 0 },
+    derden:       { mat: 0, lab: 0, trans: 0, extra: 0, pm: 0 },
+  };
+  const trackerDirects: Record<GroupKey, number> = { bouwpakket: 0, installateur: 0, assemblagehal: 0, derden: 0 };
+  const computeTrackerDirect = () => {
+    for (const g of calc.groups) {
+      const gk = g.group as string;
+      if (!(gk in trackerDirects)) continue;
+      if (isGroupOff(gk)) continue;
+      for (const r of g.rows) {
+        if (isMatOff(gk, r.material.category, r.material.id)) continue;
+        trackerComp[gk as GroupKey].mat += r.materialCost;
+      }
+    }
+    for (const br of calc.buildings) {
+      const mult = br.building.count;
+      for (const e of br.labourEntries) {
+        const gk = e.costGroup as string;
+        if (!(gk in trackerDirects)) continue;
+        if (isLabGroupOff(gk) || isLabEntryOff(gk, e.inputLabel)) continue;
+        trackerComp[gk as GroupKey].lab += e.cost * mult;
+      }
+    }
+    if (!isLabGroupOff("assemblagehal") && !isLabEntryOff("assemblagehal", "Projectmanagement")) {
+      trackerComp.assemblagehal.pm += calc.projectmgmtCost;
+    }
+    if (!isTransportOff("bouwpakket")) {
+      trackerComp.bouwpakket.trans += (calc.autoTransport.inboundCost + calc.autoTransport.outboundCost);
+    }
+    for (const g of calc.groups) {
+      const gk = g.group as string;
+      if (gk === "bouwpakket") continue;
+      if (!(gk in trackerDirects)) continue;
+      if (isTransportOff(gk)) continue;
+      trackerComp[gk as GroupKey].trans += g.transportCost;
+    }
+    for (const x of extraLines) {
+      const gk = x.costGroup as string;
+      if (!(gk in trackerDirects)) continue;
+      if (isOff(`xl:${x.id}`)) continue;
+      trackerComp[gk as GroupKey].extra += (x.quantity ?? 0) * (x.pricePerUnit ?? 0);
+    }
+    // Roll-up.
+    for (const gk of Object.keys(trackerDirects) as GroupKey[]) {
+      const c = trackerComp[gk];
+      trackerDirects[gk] = c.mat + c.lab + c.trans + c.extra + c.pm;
+    }
+  };
+  computeTrackerDirect();
+
+  // Engineering totaal — toegevoegd los van directs.
+  let engTotal = 0;
+  for (const br of buildingResults) {
+    const mods = modsByBuilding.get(br.building.id) ?? [];
+    const bvo = gfaByBuildingId.get(br.building.id) ?? 0;
+    const area = mods.reduce((s, m) => s + m.lengthM * m.widthM * m.count, 0);
+    const bgg = br.effectiveInputs["_opp_begane_grond"] ?? 0;
+    const floorsRaw = area > 0 && bgg > 0 ? area / bgg : 1;
+    const floors = Math.abs(floorsRaw - Math.round(floorsRaw)) < 0.1 ? Math.round(floorsRaw) : floorsRaw;
+    const eng = computeEngineering(mods, bvo, floors);
+    engTotal += (eng.engineeringTotal + eng.constructieTotal) * br.building.count;
+  }
+
+  // Markup-bedragen — zelfde 2-pass logica als de Excel-formules.
+  type MarkupCalc = { id: string; group: string; basis: string; type: string; pct: number; amount: number };
+  const trackerMarkups: MarkupCalc[] = [];
+  const sortedMk = [...mkRows]
+    .sort((a, b) => a.sortOrder - b.sortOrder)
+    .filter((m) => !isMarkupOff(m.costGroup, m.id));
+  // Pass 1: simpele bases
+  for (const m of sortedMk) {
+    const gk = (m.costGroup ?? "") as GroupKey;
+    let amount = 0;
+    if (m.type === "percentage") {
+      const pct = m.value / 100;
+      if (m.basis === "group_direct") {
+        amount = (trackerDirects[gk] ?? 0) * pct;
+      } else if (m.basis === "group_cumulative") {
+        const prev = trackerMarkups
+          .filter((x) => x.group === gk && !["totaal_ex_derden", "grand_total", "bouwpakket_plus_assemblage"].includes(x.basis))
+          .reduce((s, x) => s + x.amount, 0);
+        amount = ((trackerDirects[gk] ?? 0) + prev) * pct;
+      } else if (m.basis === "inkoop_derden") {
+        amount = (trackerDirects.derden ?? 0) * pct;
+      }
+    } else if (m.type === "fixed") {
+      amount = m.value;
+    }
+    trackerMarkups.push({ id: m.id, group: m.costGroup ?? "", basis: m.basis, type: m.type, pct: m.value / 100, amount });
+  }
+  // Pass 2A: TED-markups IN bp/inst/asm (basis = bp+inst+asm + non-TED markups
+  //          in those 3). Onafhankelijk van andere TED's. Dependency: alleen Pass 1.
+  const tedSet = new Set(trackerMarkups.filter((x) => x.basis === "totaal_ex_derden").map((x) => x.id));
+  for (const m of trackerMarkups) {
+    if (m.type !== "percentage" || m.basis !== "totaal_ex_derden" || m.group === "hoofdaannemer") continue;
+    const allMk = trackerMarkups.filter((x) => ["bouwpakket","installateur","assemblagehal"].includes(x.group));
+    const nonTed = allMk.filter((x) => !tedSet.has(x.id));
+    const sumMk = nonTed.reduce((s, x) => s + x.amount, 0);
+    m.amount = (trackerDirects.bouwpakket + trackerDirects.installateur + trackerDirects.assemblagehal + sumMk) * m.pct;
+  }
+  // Pass 2B: TED-markups IN hoofdaannemer (basis incl. TED markups in bp/inst/asm
+  //          die nu zijn berekend in Pass 2A).
+  for (const m of trackerMarkups) {
+    if (m.type !== "percentage" || m.basis !== "totaal_ex_derden" || m.group !== "hoofdaannemer") continue;
+    const allMk = trackerMarkups.filter((x) => ["bouwpakket","installateur","assemblagehal"].includes(x.group));
+    const sumMk = allMk.reduce((s, x) => s + x.amount, 0);
+    m.amount = (trackerDirects.bouwpakket + trackerDirects.installateur + trackerDirects.assemblagehal + sumMk) * m.pct;
+  }
+  // Pass 3: bp+asm en grand_total — gebruiken alle markups in bp/asm (resp. bp/inst/asm/der)
+  //         inclusief de TED's uit Pass 2A. Hoofdaannemer-markups zelf nooit in basis.
+  for (const m of trackerMarkups) {
+    if (m.type !== "percentage") continue;
+    if (m.basis === "bouwpakket_plus_assemblage") {
+      const sumMk = trackerMarkups.filter((x) => x.group === "bouwpakket" || x.group === "assemblagehal").reduce((s, x) => s + x.amount, 0);
+      m.amount = (trackerDirects.bouwpakket + trackerDirects.assemblagehal + sumMk) * m.pct;
+    } else if (m.basis === "grand_total") {
+      const sumMk = trackerMarkups.filter((x) => ["bouwpakket","installateur","assemblagehal","derden"].includes(x.group)).reduce((s, x) => s + x.amount, 0);
+      m.amount = (trackerDirects.bouwpakket + trackerDirects.installateur + trackerDirects.assemblagehal + trackerDirects.derden + sumMk) * m.pct;
+    }
+  }
+  const trackerMarkupTotal = trackerMarkups.reduce((s, x) => s + x.amount, 0);
+  const expectedAppTotal =
+    trackerDirects.bouwpakket + trackerDirects.installateur + trackerDirects.assemblagehal + trackerDirects.derden
+    + trackerMarkupTotal
+    + engTotal;
+
+  if (includeSanity) {
+  row++;
+  const sanityHeaderRow = row;
+  ws.mergeCells(`A${sanityHeaderRow}:H${sanityHeaderRow}`);
+  const sHdr = ws.getCell(`A${sanityHeaderRow}`);
+  sHdr.value = "SANITY CHECK — server-tracker per component (vergelijk met Subtotaal-direct per groep)";
+  sHdr.font = { name: "Inter", size: 10, bold: true, color: { argb: COLOR.muted } };
+  sHdr.alignment = { vertical: "middle", indent: 1 };
+  sHdr.fill = { type: "pattern", pattern: "solid", fgColor: { argb: COLOR.surface } };
+  ws.getRow(sanityHeaderRow).height = 18;
+  row++;
+
+  // Per-groep direct breakdown (= materialen + arbeid + transport + extras + PM).
+  // Vergelijk met "Subtotaal {groep} (direct)" cel in elke groep.
+  const breakdown: { label: string; value: number; excelRef?: string }[] = [
+    { label: "Bouwpakket (direct, tracker)",   value: trackerDirects.bouwpakket,   excelRef: groupCells.bouwpakket.directCellRef },
+    { label: "Installateur (direct, tracker)", value: trackerDirects.installateur, excelRef: groupCells.installateur.directCellRef },
+    { label: "Assemblagehal (direct, tracker)", value: trackerDirects.assemblagehal, excelRef: groupCells.assemblagehal.directCellRef },
+    { label: "Inkoop derden (direct, tracker)", value: trackerDirects.derden,      excelRef: groupCells.derden.directCellRef },
+  ];
+  for (const b of breakdown) {
+    setRow(row, [b.label, null, null, null, null, null, b.value, null], {
+      italic: true, color: COLOR.muted, indent: 1,
+    });
+    ws.getCell(`G${row}`).numFmt = EUR;
+    if (b.excelRef) {
+      ws.getCell(`H${row}`).value = { formula: `IF(ABS(${b.excelRef}-G${row})<0.5,"OK","Excel: "&TEXT(${b.excelRef},"€ #,##0")&" diff "&TEXT(${b.excelRef}-G${row},"€ #,##0;-€ #,##0")&"")` };
+      ws.getCell(`H${row}`).font = { name: "Inter", size: 9, color: { argb: COLOR.muted } };
+    }
+    row++;
+  }
+  // Sub-breakdown per groep (mat / lab / trans / extra / pm).
+  for (const gk of ["bouwpakket", "installateur", "assemblagehal", "derden"] as GroupKey[]) {
+    const c = trackerComp[gk];
+    const total = c.mat + c.lab + c.trans + c.extra + c.pm;
+    if (total === 0) continue;
+    const indent = (label: string) => `   ${label}`;
+    setRow(row, [indent(`${gk} · materialen`),  null, null, null, null, null, c.mat,   null], { italic: true, color: COLOR.muted, indent: 2 }); ws.getCell(`G${row}`).numFmt = EUR; row++;
+    setRow(row, [indent(`${gk} · arbeid`),      null, null, null, null, null, c.lab,   null], { italic: true, color: COLOR.muted, indent: 2 }); ws.getCell(`G${row}`).numFmt = EUR; row++;
+    setRow(row, [indent(`${gk} · transport`),   null, null, null, null, null, c.trans, null], { italic: true, color: COLOR.muted, indent: 2 }); ws.getCell(`G${row}`).numFmt = EUR; row++;
+    setRow(row, [indent(`${gk} · extra-posten`), null, null, null, null, null, c.extra, null], { italic: true, color: COLOR.muted, indent: 2 }); ws.getCell(`G${row}`).numFmt = EUR; row++;
+    if (gk === "assemblagehal") {
+      setRow(row, [indent(`${gk} · PM`),         null, null, null, null, null, c.pm,    null], { italic: true, color: COLOR.muted, indent: 2 }); ws.getCell(`G${row}`).numFmt = EUR; row++;
+    }
+  }
+  // Markup-bedragen (server-tracker totaal) — alleen totaal, geen per-markup vergelijk.
+  setRow(row, ["Markups totaal (alle groepen + hoofdaannemer, tracker)", null, null, null, null, null, trackerMarkupTotal, null], {
+    italic: true, color: COLOR.muted, indent: 1,
+  });
+  ws.getCell(`G${row}`).numFmt = EUR;
+  row++;
+  // Engineering.
+  setRow(row, ["Engineering (tracker)", null, null, null, null, null, engTotal, null], {
+    italic: true, color: COLOR.muted, indent: 1,
+  });
+  ws.getCell(`G${row}`).numFmt = EUR;
+  row++;
+
+  // Verwacht totaal + vergelijk met Excel grand total.
+  setRow(row, ["Verwacht totaal (tracker som)", null, null, null, null, null, expectedAppTotal, null], {
+    italic: true, color: COLOR.muted, indent: 1,
+  });
+  ws.getCell(`G${row}`).numFmt = EUR;
+  const expectedRow = row;
+  row++;
+  setRow(row, ["Excel grand total (formule)", null, null, null, null, null, null, null], { italic: true, color: COLOR.muted, indent: 1 });
+  ws.getCell(`G${row}`).value = { formula: `G${grandTotalRow}` };
+  ws.getCell(`G${row}`).numFmt = EUR;
+  const excelRow = row;
+  row++;
+  setRow(row, ["Verschil (Excel − tracker)", null, null, null, null, null, null, null], { italic: true, color: COLOR.muted, indent: 1 });
+  ws.getCell(`G${row}`).value = { formula: `G${excelRow}-G${expectedRow}` };
+  ws.getCell(`G${row}`).numFmt = EUR;
+  const diffRow = row;
+  row++;
+  setRow(row, ["Status", null, null, null, null, null, null, null], { bold: true, indent: 1 });
+  ws.getCell(`G${row}`).value = { formula: `IF(ABS(G${diffRow})<0.5,"OK","MISMATCH")` };
+  ws.getCell(`G${row}`).font = { name: "Inter", size: 10, bold: true };
+  row++;
+  } // end if (includeSanity) — Tab 1
+
+  // Server-side log voor stille mismatch-detectie zonder dat het in Excel komt.
+  // Als deze warning komt is er een formule-bug; check via ?sanity=1.
+  // Geen vergelijking mogelijk hier zonder Excel formule te evalueren — we loggen
+  // alleen het verwachte totaal voor traceability.
+  console.log(`[export] project=${project.id} expectedTotal=€${expectedAppTotal.toFixed(2)}`);
+
   // Freeze top header rows.
   ws.views = [{ state: "frozen", ySplit: 4, showGridLines: false }];
 
@@ -946,10 +1224,18 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
     if (isGroupOff(groupKey)) continue;
 
     // Aggregaat: inputLabel → materialId → MatAgg. Filter materialen die uit staan.
+    // Materialen ZONDER contributions (Kolomcorrectie / S2P stelposten / CSV)
+    // vangen we apart op zodat ze niet uit Tab 2 verdwijnen.
     const byInput = new Map<string, Map<string, MatAgg>>();
+    const synthRows: typeof g.rows = [];
     for (const matRow of g.rows) {
       if (isMatOff(groupKey, matRow.material.category, matRow.material.id)) continue;
-      for (const c of matRow.contributions ?? []) {
+      const contribs = matRow.contributions ?? [];
+      if (contribs.length === 0) {
+        synthRows.push(matRow);
+        continue;
+      }
+      for (const c of contribs) {
         const innerMap = byInput.get(c.inputLabel) ?? new Map<string, MatAgg>();
         const ex = innerMap.get(matRow.material.id);
         if (ex) {
@@ -967,7 +1253,7 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
         byInput.set(c.inputLabel, innerMap);
       }
     }
-    if (byInput.size === 0) continue;
+    if (byInput.size === 0 && synthRows.length === 0) continue;
 
     // Group header bar.
     ws2.mergeCells(`A${r2}:H${r2}`);
@@ -993,7 +1279,7 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
 
     for (const inputLabel of inputLabels) {
       const matsByMat = byInput.get(inputLabel)!;
-      const mats = Array.from(matsByMat.values()).sort((a, b) => b.netto * (b.material.pricePerUnit ?? 0) - a.netto * (a.material.pricePerUnit ?? 0));
+      const mats = Array.from(matsByMat.values()).sort((a, b) => b.netto * (b.materialRow.price ?? 0) - a.netto * (a.materialRow.price ?? 0));
 
       const labelHeaderRow = r2;
       r2++;
@@ -1006,15 +1292,18 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
         const matName = m.material.description
           ? `${m.material.name} — ${m.material.description}`
           : m.material.name;
-        const loss = m.material.lossPct ?? 0;
-        setRow2(rn, [matName, m.inputQty, "", m.ratio, loss, null, m.material.pricePerUnit ?? 0, null], { indent: 2 });
+        // Effectieve prijs/verlies uit de calc-row (bevat GEVA-variant en
+        // building-overrides). NIET m.material.pricePerUnit/lossPct (raw DB).
+        const loss = m.materialRow.loss ?? 0;
+        const price = m.materialRow.price ?? 0;
+        setRow2(rn, [matName, m.inputQty, "", m.ratio, loss, null, price, null], { indent: 2 });
         ws2.getCell(`F${rn}`).value = { formula: `B${rn}*D${rn}*(1+E${rn})` };
         ws2.getCell(`H${rn}`).value = { formula: `F${rn}*G${rn}` };
         ws2.getCell(`B${rn}`).numFmt = NUM;
         ws2.getCell(`D${rn}`).numFmt = NUM2;
         ws2.getCell(`E${rn}`).numFmt = PCT;
         ws2.getCell(`F${rn}`).numFmt = NUM;
-        ws2.getCell(`G${rn}`).numFmt = (m.material.pricePerUnit ?? 0) <= 10 && (m.material.pricePerUnit ?? 0) > 0 ? EUR2 : EUR;
+        ws2.getCell(`G${rn}`).numFmt = price <= 10 && price > 0 ? EUR2 : EUR;
         ws2.getCell(`H${rn}`).numFmt = EUR;
         r2++;
       }
@@ -1025,6 +1314,162 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
       ws2.getCell(`H${labelHeaderRow}`).value = { formula: `SUBTOTAL(9,H${detailStart}:H${detailEnd})` };
       ws2.getCell(`H${labelHeaderRow}`).numFmt = EUR;
       ws2.getCell(`H${labelHeaderRow}`).font = { name: "Inter", size: 10, bold: true };
+    }
+
+    // Synthetische rijen (Kolomcorrectie / S2P / CSV-imports — geen kengetal-link).
+    if (synthRows.length > 0) {
+      const sh = r2;
+      r2++;
+      const sstart = r2;
+      for (const r of synthRows) {
+        const rn = r2;
+        ws2.getRow(rn).outlineLevel = 1;
+        ws2.getRow(rn).hidden = true;
+        const matName = r.material.description
+          ? `${r.material.name} — ${r.material.description}`
+          : r.material.name;
+        // Geen kengetal-input → geen ratio. Toon netto direct.
+        // A=naam, B=netto, C=eh, D=1 (ratio), E=loss, F=bruto formule, G=prijs, H=bedrag
+        setRow2(rn, [matName, r.netto, r.material.unit, 1, r.loss, null, r.price, null], { indent: 2 });
+        ws2.getCell(`F${rn}`).value = { formula: `B${rn}*D${rn}*(1+E${rn})` };
+        ws2.getCell(`H${rn}`).value = { formula: `F${rn}*G${rn}` };
+        ws2.getCell(`B${rn}`).numFmt = NUM;
+        ws2.getCell(`D${rn}`).numFmt = NUM2;
+        ws2.getCell(`E${rn}`).numFmt = PCT;
+        ws2.getCell(`F${rn}`).numFmt = NUM;
+        ws2.getCell(`G${rn}`).numFmt = (r.price ?? 0) <= 10 && (r.price ?? 0) > 0 ? EUR2 : EUR;
+        ws2.getCell(`H${rn}`).numFmt = EUR;
+        r2++;
+      }
+      const send = r2 - 1;
+      setRow2(sh, ["Overige posten (geen kengetal-link)", null, null, null, null, null, null, null], {
+        bold: true, indent: 1, fill: COLOR.rowAlt,
+      });
+      ws2.getCell(`H${sh}`).value = { formula: `SUBTOTAL(9,H${sstart}:H${send})` };
+      ws2.getCell(`H${sh}`).numFmt = EUR;
+      ws2.getCell(`H${sh}`).font = { name: "Inter", size: 10, bold: true };
+    }
+
+    // ── Extra leaves: arbeid + transport + handmatige posten + PM ──
+    // Zelfde items als in Tab 1 zodat het direct-totaal van Tab 2 overeenkomt.
+
+    // Per-kengetal arbeid (assemblage/installatie/arbeid-buiten/bewerking).
+    const labEntries: { e: typeof calc.buildings[number]["labourEntries"][number]; mult: number }[] = [];
+    if (!isLabGroupOff(groupKey)) {
+      for (const br of calc.buildings) {
+        const mult = br.building.count;
+        for (const e of br.labourEntries) {
+          if (e.costGroup !== groupKey) continue;
+          if (isLabEntryOff(groupKey, e.inputLabel)) continue;
+          labEntries.push({ e, mult });
+        }
+      }
+    }
+    const showProjectMgmt2 = groupKey === "assemblagehal" && calc.projectmgmtCost > 0
+      && !isLabGroupOff(groupKey) && !isLabEntryOff(groupKey, "Projectmanagement");
+    if (labEntries.length > 0 || showProjectMgmt2) {
+      const lh = r2;
+      r2++;
+      const lstart = r2;
+      const collapse = (l: string) => l.replace(/^Module Aant (BG|Dak|Tussenvd)(\s—|$)/, "Module Aant$2");
+      const agg = new Map<string, { qty: number; rate: number; cost: number; unit: string }>();
+      for (const { e, mult } of labEntries) {
+        const key = collapse(e.inputLabel);
+        const unit = groupKey === "bouwpakket" ? "m³" : "u";
+        const ex = agg.get(key);
+        const addQty = e.totalHours * mult, addCost = e.cost * mult;
+        if (ex) { ex.qty += addQty; ex.cost += addCost; }
+        else agg.set(key, { qty: addQty, rate: 0, cost: addCost, unit });
+      }
+      // Recompute weighted rate zodat B*F == cost.
+      for (const v of agg.values()) v.rate = v.qty > 0 ? v.cost / v.qty : 0;
+      for (const [label, v] of Array.from(agg.entries()).sort(([, a], [, b]) => b.cost - a.cost)) {
+        const rn = r2;
+        ws2.getRow(rn).outlineLevel = 1;
+        ws2.getRow(rn).hidden = true;
+        // A=label, B=qty, C=eh, D-E leeg, F=rate, G leeg, H=bedrag
+        setRow2(rn, [label, v.qty, v.unit, null, null, v.rate, null, null], { indent: 2 });
+        ws2.getCell(`H${rn}`).value = { formula: `B${rn}*F${rn}` };
+        ws2.getCell(`B${rn}`).numFmt = NUM;
+        ws2.getCell(`F${rn}`).numFmt = v.rate <= 10 && v.rate > 0 ? EUR2 : EUR;
+        ws2.getCell(`H${rn}`).numFmt = EUR;
+        r2++;
+      }
+      // Project-niveau PM bij assemblagehal.
+      if (groupKey === "assemblagehal" && calc.projectmgmtCost > 0
+          && !isLabGroupOff(groupKey) && !isLabEntryOff(groupKey, "Projectmanagement")) {
+        const rn = r2;
+        ws2.getRow(rn).outlineLevel = 1;
+        ws2.getRow(rn).hidden = true;
+        setRow2(rn, ["Projectmanagement", calc.projectmgmtHours, "u", null, null, rates.projectmgmtHourlyRate, null, null], { indent: 2 });
+        ws2.getCell(`H${rn}`).value = { formula: `B${rn}*F${rn}` };
+        ws2.getCell(`B${rn}`).numFmt = NUM;
+        ws2.getCell(`F${rn}`).numFmt = EUR;
+        ws2.getCell(`H${rn}`).numFmt = EUR;
+        r2++;
+      }
+      const lend = r2 - 1;
+      const ltitle = groupKey === "bouwpakket" ? "Bouwpakket-bewerking" : "Arbeid";
+      setRow2(lh, [ltitle, null, null, null, null, null, null, null], { bold: true, indent: 1, fill: COLOR.rowAlt });
+      ws2.getCell(`H${lh}`).value = { formula: `SUBTOTAL(9,H${lstart}:H${lend})` };
+      ws2.getCell(`H${lh}`).numFmt = EUR;
+      ws2.getCell(`H${lh}`).font = { name: "Inter", size: 10, bold: true };
+    }
+
+    // Transport — auto Polen voor bouwpakket, manueel voor assemblagehal.
+    if (groupKey === "bouwpakket" && (calc.autoTransport.inboundCost + calc.autoTransport.outboundCost) > 0 && !isTransportOff(groupKey)) {
+      const th = r2;
+      r2++;
+      const tstart = r2;
+      [
+        { label: "→ VMG Polen — I-joists", trucks: calc.autoTransport.inboundTrucks, price: 700 },
+        { label: "← Lodz → NL — bouwpakket", trucks: calc.autoTransport.outboundTrucks, price: 1600 },
+      ].forEach(({ label, trucks, price }) => {
+        const rn = r2;
+        ws2.getRow(rn).outlineLevel = 1;
+        ws2.getRow(rn).hidden = true;
+        setRow2(rn, [label, trucks, "truck(s)", null, null, price, null, null], { indent: 2 });
+        ws2.getCell(`H${rn}`).value = { formula: `B${rn}*F${rn}` };
+        ws2.getCell(`F${rn}`).numFmt = EUR;
+        ws2.getCell(`H${rn}`).numFmt = EUR;
+        r2++;
+      });
+      const tend = r2 - 1;
+      setRow2(th, ["Transport Polen", null, null, null, null, null, null, null], { bold: true, indent: 1, fill: COLOR.rowAlt });
+      ws2.getCell(`H${th}`).value = { formula: `SUBTOTAL(9,H${tstart}:H${tend})` };
+      ws2.getCell(`H${th}`).numFmt = EUR;
+      ws2.getCell(`H${th}`).font = { name: "Inter", size: 10, bold: true };
+    } else if (g.transportCost > 0 && !isTransportOff(groupKey)) {
+      const rn = r2;
+      // Tab 2: bedrag-kolom is H (index 7), niet G. Vorige versie zette de
+      // waarde in G → H SUBTOTAL miste de transport-post (€182k voor x-ray).
+      setRow2(rn, ["Transport", null, null, null, null, null, null, g.transportCost], { bold: true, indent: 1, fill: COLOR.rowAlt });
+      ws2.getCell(`H${rn}`).numFmt = EUR;
+      r2++;
+    }
+
+    // Handmatige posten.
+    const groupExtras2 = extraLines.filter((x) => x.costGroup === groupKey && !isOff(`xl:${x.id}`));
+    if (groupExtras2.length > 0) {
+      const xh = r2;
+      r2++;
+      const xstart = r2;
+      for (const x of groupExtras2) {
+        const rn = r2;
+        ws2.getRow(rn).outlineLevel = 1;
+        ws2.getRow(rn).hidden = true;
+        setRow2(rn, [x.description || "Handmatige post", x.quantity, x.unit, null, null, x.pricePerUnit, null, null], { indent: 2 });
+        ws2.getCell(`H${rn}`).value = { formula: `B${rn}*F${rn}` };
+        ws2.getCell(`B${rn}`).numFmt = NUM;
+        ws2.getCell(`F${rn}`).numFmt = EUR;
+        ws2.getCell(`H${rn}`).numFmt = EUR;
+        r2++;
+      }
+      const xend = r2 - 1;
+      setRow2(xh, ["Handmatige posten", null, null, null, null, null, null, null], { bold: true, indent: 1, fill: COLOR.rowAlt });
+      ws2.getCell(`H${xh}`).value = { formula: `SUBTOTAL(9,H${xstart}:H${xend})` };
+      ws2.getCell(`H${xh}`).numFmt = EUR;
+      ws2.getCell(`H${xh}`).font = { name: "Inter", size: 10, bold: true };
     }
 
     const groupDataEnd = r2 - 1;
@@ -1182,6 +1627,63 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
   ws2.getCell(`H${grandValueRow}`).font = { name: "Inter", size: 14, bold: true, color: { argb: COLOR.brand } };
   ws2.getRow(grandValueRow).height = 26;
   r2++;
+
+  if (includeSanity) {
+  // ── Sanity check (Tab 2) — per-component breakdown ─────────────
+  r2++;
+  const sHdr2Row = r2;
+  ws2.mergeCells(`A${sHdr2Row}:H${sHdr2Row}`);
+  const sHdr2 = ws2.getCell(`A${sHdr2Row}`);
+  sHdr2.value = "SANITY CHECK — server-tracker per component (vergelijk met Subtotaal-direct per groep)";
+  sHdr2.font = { name: "Inter", size: 10, bold: true, color: { argb: COLOR.muted } };
+  sHdr2.alignment = { vertical: "middle", indent: 1 };
+  sHdr2.fill = { type: "pattern", pattern: "solid", fgColor: { argb: COLOR.surface } };
+  ws2.getRow(sHdr2Row).height = 18;
+  r2++;
+
+  const breakdown2: { label: string; value: number; excelRef?: string }[] = [
+    { label: "Bouwpakket (direct, tracker)",   value: trackerDirects.bouwpakket,   excelRef: ws2GroupDirectRef.bouwpakket },
+    { label: "Installateur (direct, tracker)", value: trackerDirects.installateur, excelRef: ws2GroupDirectRef.installateur },
+    { label: "Assemblagehal (direct, tracker)", value: trackerDirects.assemblagehal, excelRef: ws2GroupDirectRef.assemblagehal },
+    { label: "Inkoop derden (direct, tracker)", value: trackerDirects.derden,      excelRef: ws2GroupDirectRef.derden },
+  ];
+  for (const b of breakdown2) {
+    setRow2(r2, [b.label, null, null, null, null, null, null, b.value], { italic: true, color: COLOR.muted, indent: 1 });
+    ws2.getCell(`H${r2}`).numFmt = EUR;
+    if (b.excelRef) {
+      ws2.getCell(`G${r2}`).value = { formula: `${b.excelRef}` };
+      ws2.getCell(`G${r2}`).numFmt = EUR;
+      ws2.getCell(`G${r2}`).font = { name: "Inter", size: 9, color: { argb: COLOR.muted } };
+    }
+    r2++;
+  }
+  setRow2(r2, ["Markups totaal (tracker)", null, null, null, null, null, null, trackerMarkupTotal], { italic: true, color: COLOR.muted, indent: 1 });
+  ws2.getCell(`H${r2}`).numFmt = EUR;
+  r2++;
+  setRow2(r2, ["Engineering (tracker)", null, null, null, null, null, null, engTotal], { italic: true, color: COLOR.muted, indent: 1 });
+  ws2.getCell(`H${r2}`).numFmt = EUR;
+  r2++;
+  setRow2(r2, ["Verwacht totaal (tracker som)", null, null, null, null, null, null, expectedAppTotal], {
+    italic: true, color: COLOR.muted, indent: 1,
+  });
+  ws2.getCell(`H${r2}`).numFmt = EUR;
+  const ws2ExpectedRow = r2;
+  r2++;
+  setRow2(r2, ["Excel grand total (formule)", null, null, null, null, null, null, null], { italic: true, color: COLOR.muted, indent: 1 });
+  ws2.getCell(`H${r2}`).value = { formula: `H${grandValueRow}` };
+  ws2.getCell(`H${r2}`).numFmt = EUR;
+  const ws2ExcelRow = r2;
+  r2++;
+  setRow2(r2, ["Verschil (Excel − tracker)", null, null, null, null, null, null, null], { italic: true, color: COLOR.muted, indent: 1 });
+  ws2.getCell(`H${r2}`).value = { formula: `H${ws2ExcelRow}-H${ws2ExpectedRow}` };
+  ws2.getCell(`H${r2}`).numFmt = EUR;
+  const ws2DiffRow = r2;
+  r2++;
+  setRow2(r2, ["Status", null, null, null, null, null, null, null], { bold: true, indent: 1 });
+  ws2.getCell(`H${r2}`).value = { formula: `IF(ABS(H${ws2DiffRow})<0.5,"OK","MISMATCH")` };
+  ws2.getCell(`H${r2}`).font = { name: "Inter", size: 10, bold: true };
+  r2++;
+  } // end if (includeSanity) — Tab 2
 
   ws2.views = [{ state: "frozen", ySplit: 1, showGridLines: false }];
   ws2.properties = { ...ws2.properties, outlineProperties: { summaryBelow: false, summaryRight: false } };

@@ -526,7 +526,6 @@ export function calculateBuilding(
   // "Aantal kozijnen" wordt alleen overschreven als de composite expliciet bestaat.
   if (effectiveInputs["_gevel_m1"] != null) {
     const DAKRAND_HOOGTE_M = 0.5;
-    const KOZIJN_OPP_PER_STUK = 1.8;
     const DEFAULT_VERDIEPINGSHOOGTE = 3.155;
     const gevelM1 = effectiveInputs["_gevel_m1"] ?? 0;
     const pctGlas = effectiveInputs["_pct_glas"] ?? 0;
@@ -538,13 +537,10 @@ export function calculateBuilding(
     }
     const avgHoogte = totalCount > 0 ? weightedHoogte / totalCount : DEFAULT_VERDIEPINGSHOOGTE;
     const dakomtrek = effectiveInputs["Dakomtrek"] ?? 0;
-    const voordeurInKozijn = effectiveInputs["_voordeur_in_kozijn"] != null
-      ? effectiveInputs["_voordeur_in_kozijn"] > 0
-      : true;
-    const aantalVoordeuren = effectiveInputs["Aantal appartementen"] ?? 0;
-    const voordeurExtraOpp = voordeurInKozijn ? 0 : aantalVoordeuren * KOZIJN_OPP_PER_STUK;
+    // Vinkje "_voordeur_in_kozijn" is informatief over of de voordeur in de gevel
+    // of aan de kernzijde zit; geen effect op Open/Dichte gevel-opp.
     const gevelOpp = gevelM1 * avgHoogte + dakomtrek * DAKRAND_HOOGTE_M;
-    const openGevel = gevelOpp * (pctGlas / 100) + voordeurExtraOpp;
+    const openGevel = gevelOpp * (pctGlas / 100);
     const dichteGevel = Math.max(0, gevelOpp - openGevel);
     effectiveInputs["Dichte gevel"] = dichteGevel;
     effectiveInputs["Open gevel"] = openGevel;
@@ -570,6 +566,13 @@ export function calculateBuilding(
   // en de badkamers/los toilet (kengetallen + arbeid). Stelposten worden onderaan
   // synthetisch toegevoegd.
   const s2pActive = (inputs.find((i) => i.inputLabel === "_s2p")?.quantity ?? 0) > 0;
+
+  // Wanneer voordeur onderdeel is van het gerekende kozijnoppervlak, zit de
+  // arbeid voor de voordeur al in de kozijn-arbeid (KOZ). We slaan dan de
+  // labour-rij voor "Aantal voordeuren" over om dubbeltelling te voorkomen.
+  const voordeurInKozijnLabour = effectiveInputs["_voordeur_in_kozijn"] != null
+    ? effectiveInputs["_voordeur_in_kozijn"] > 0
+    : true;
 
   // Apply kengetallen → per-material netto quantities. Arbeid komt NIET meer uit de
   // material-row of de kengetal-row, maar uit aparte `kengetal_labour` rijen
@@ -749,6 +752,7 @@ export function calculateBuilding(
   const labourEntries: CategoryLabourEntry[] = [];
   for (const lr of labourRows) {
     if (s2pActive && S2P_REPLACED_LABELS.has(lr.inputLabel)) continue;
+    if (voordeurInKozijnLabour && lr.inputLabel === "Aantal voordeuren") continue;
     const qty = effectiveInputs[lr.inputLabel] ?? 0;
     if (qty <= 0) continue;
 

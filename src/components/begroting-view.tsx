@@ -381,31 +381,85 @@ export function BegrotingView({ scope, density = "normal" }: Props) {
   const effGrandTotal     = effTotaalExDerden + effInkoopDerden;
   const effBpPlusAsm      = effectiveDirects.bouwpakket + effectiveDirects.assemblagehal;
 
-  /** Effectieve basis-bedrag voor een markup; gebruikt door tooltips/cellen om
-   *  consistent met effectiveMarkupAmount(m) te tonen. */
-  function effectiveBasisAmount(m: MarkupCalcRow): number {
-    switch (m.basis) {
-      case "totaal_ex_derden":          return effTotaalExDerden;
-      case "inkoop_derden":             return effInkoopDerden;
-      case "grand_total":               return effGrandTotal;
-      case "bouwpakket_plus_assemblage": return effBpPlusAsm;
-      default:                          return m.basisAmount;
+  // Multi-pass markup-amount precompute — spiegel van calculation.ts pass 1+2 en
+  // van de Excel-formules. Cruciaal: TED/bp+asm/grand_total bases tellen óók
+  // markups in bp/inst/asm/der op (niet alleen directe kosten). Vorige versie
+  // miste die optelling waardoor app-totaal afweek van calc/Excel.
+  const effMkAmt = new Map<string, number>();
+  type MkEntry = { gKey: CostGroup; m: MarkupCalcRow };
+  const allMarkupsForBasis: MkEntry[] = [];
+  for (const g of groupsForBases) {
+    for (const m of g.markups) {
+      if (!isMarkupEnabled(g.group, m.id)) continue;
+      allMarkupsForBasis.push({ gKey: g.group, m });
+    }
+  }
+  // Pass 1: simpele bases (group_direct / group_cumulative / inkoop_derden / fixed / per_m2).
+  for (const { gKey, m } of allMarkupsForBasis) {
+    const pct = m.value / 100;
+    if (m.type !== "percentage") {
+      effMkAmt.set(m.id, m.amount); // fixed/per_m2 — gebruik calc waarde
+      continue;
+    }
+    if (m.basis === "group_direct") {
+      effMkAmt.set(m.id, (effectiveDirects[gKey] ?? 0) * pct);
+    } else if (m.basis === "group_cumulative") {
+      const prev = allMarkupsForBasis
+        .filter((x) => x.gKey === gKey && x.m.id !== m.id
+          && !["totaal_ex_derden", "grand_total", "bouwpakket_plus_assemblage"].includes(x.m.basis))
+        .reduce((s, x) => s + (effMkAmt.get(x.m.id) ?? 0), 0);
+      effMkAmt.set(m.id, ((effectiveDirects[gKey] ?? 0) + prev) * pct);
+    } else if (m.basis === "inkoop_derden") {
+      effMkAmt.set(m.id, (effectiveDirects.derden ?? 0) * pct);
+    } else {
+      effMkAmt.set(m.id, 0); // deferred
+    }
+  }
+  // Pass 2A: TED-markups IN bp/inst/asm (basis = directs + non-TED markups in die 3).
+  for (const { gKey, m } of allMarkupsForBasis) {
+    if (m.basis !== "totaal_ex_derden") continue;
+    if (gKey === "hoofdaannemer") continue;
+    const nonTedSum = allMarkupsForBasis
+      .filter((x) => ["bouwpakket","installateur","assemblagehal"].includes(x.gKey) && x.m.basis !== "totaal_ex_derden")
+      .reduce((s, x) => s + (effMkAmt.get(x.m.id) ?? 0), 0);
+    effMkAmt.set(m.id, (effectiveDirects.bouwpakket + effectiveDirects.installateur + effectiveDirects.assemblagehal + nonTedSum) * (m.value / 100));
+  }
+  // Pass 2B: TED in hoofdaannemer (basis = directs + ALLE bp/inst/asm markups, incl TED).
+  for (const { gKey, m } of allMarkupsForBasis) {
+    if (m.basis !== "totaal_ex_derden") continue;
+    if (gKey !== "hoofdaannemer") continue;
+    const allSum = allMarkupsForBasis
+      .filter((x) => ["bouwpakket","installateur","assemblagehal"].includes(x.gKey))
+      .reduce((s, x) => s + (effMkAmt.get(x.m.id) ?? 0), 0);
+    effMkAmt.set(m.id, (effectiveDirects.bouwpakket + effectiveDirects.installateur + effectiveDirects.assemblagehal + allSum) * (m.value / 100));
+  }
+  // Pass 3: bp+asm en grand_total.
+  for (const { gKey, m } of allMarkupsForBasis) {
+    const pct = m.value / 100;
+    if (m.basis === "bouwpakket_plus_assemblage") {
+      const sum = allMarkupsForBasis
+        .filter((x) => x.gKey === "bouwpakket" || x.gKey === "assemblagehal")
+        .reduce((s, x) => s + (effMkAmt.get(x.m.id) ?? 0), 0);
+      effMkAmt.set(m.id, (effectiveDirects.bouwpakket + effectiveDirects.assemblagehal + sum) * pct);
+    } else if (m.basis === "grand_total") {
+      const sum = allMarkupsForBasis
+        .filter((x) => ["bouwpakket","installateur","assemblagehal","derden"].includes(x.gKey))
+        .reduce((s, x) => s + (effMkAmt.get(x.m.id) ?? 0), 0);
+      effMkAmt.set(m.id, (effectiveDirects.bouwpakket + effectiveDirects.installateur + effectiveDirects.assemblagehal + effectiveDirects.derden + sum) * pct);
     }
   }
 
-  /** Markup-bedrag herberekend op basis van de huidige disabled-vinkjes. Voor
-   *  group-locale bases (group_direct/group_cumulative) houden we de oorspronkelijke
-   *  m.amount aan — die hangt al van markup-volgorde af en wordt elders gerespecteerd. */
+  /** Effectieve basis-bedrag voor een markup; gebruikt door tooltips/cellen. */
+  function effectiveBasisAmount(m: MarkupCalcRow): number {
+    if (m.type !== "percentage") return m.basisAmount;
+    const amt = effMkAmt.get(m.id);
+    if (amt == null || m.value === 0) return m.basisAmount;
+    return amt / (m.value / 100);
+  }
+
+  /** Markup-bedrag herberekend met dezelfde 2-pass logica als calc.ts. */
   function effectiveMarkupAmount(m: MarkupCalcRow): number {
-    if (m.type !== "percentage") return m.amount;
-    const pct = m.value / 100;
-    switch (m.basis) {
-      case "totaal_ex_derden":          return effTotaalExDerden * pct;
-      case "inkoop_derden":             return effInkoopDerden * pct;
-      case "grand_total":               return effGrandTotal * pct;
-      case "bouwpakket_plus_assemblage": return effBpPlusAsm * pct;
-      default:                          return m.amount;
-    }
+    return effMkAmt.get(m.id) ?? m.amount;
   }
 
   // Effectief subtotaal per groep op basis van disabled-set (zelfde logica als renderGroup).
